@@ -1,0 +1,78 @@
+# Configuration for Sonata-LiDiff Training
+
+# Dataset
+data_path: "Datasets/SemanticKITTI/dataset"
+voxel_size: 0.05
+batch_size: 4
+num_workers: 4
+
+# Model Architecture
+encoder:
+  pretrained: "facebook/sonata"
+  freeze: true  # Freeze initially, fine-tune later if needed
+  enable_flash: true
+  feature_levels: [2, 3, 4]
+
+diffusion:
+  num_timesteps: 1000
+  schedule: "cosine"  # Options: linear, cosine, sigmoid
+  beta_start: 0.0001
+  beta_end: 0.02
+  denoising_steps: 50  # For inference
+
+conditioning:
+  fusion_type: "attention"  # Options: concat, attention, hierarchical
+  condition_dim: 256
+
+denoising_network:
+  hidden_dims: [64, 128, 256, 512]
+  time_embed_dim: 128
+  num_neighbors: 16
+
+# Training Hyperparameters
+training:
+  num_epochs: 100
+  learning_rate: 0.0001
+  weight_decay: 0.01
+  warmup_epochs: 10
+  gradient_clip: 1.0
+  accumulation_steps: 1
+  
+  # Optimizer
+  optimizer: "adamw"
+  betas: [0.9, 0.999]
+  eps: 1.0e-8
+  
+  # LR Scheduler
+  scheduler: "cosine"
+  min_lr: 1.0e-6
+
+# Loss Weights
+loss:
+  diffusion_weight: 1.0
+  semantic_weight: 0.0  # Add semantic loss if needed
+  geometric_weight: 0.0  # Add geometric loss if needed
+
+# Checkpointing
+checkpoint:
+  save_freq: 5  # Save every N epochs
+  eval_freq: 1  # Evaluate every N epochs
+  output_dir: "checkpoints/diffusion"
+  log_dir: "logs/diffusion"
+
+# Evaluation
+evaluation:
+  metrics: ["completion", "chamfer", "iou"]
+  completion_thresholds: [0.5, 0.2, 0.1]  # cm
+  visualize_samples: 5
+
+# Data Augmentation
+augmentation:
+  rotation: true
+  flip: true
+  scale: [0.95, 1.05]
+  jitter: 0.01
+
+# Hardware
+device: "cuda"
+mixed_precision: false  # Enable AMP if needed

@@ -1,0 +1,8 @@
+README.md
+setup.py
+sonata_lidiff.egg-info/PKG-INFO
+sonata_lidiff.egg-info/SOURCES.txt
+sonata_lidiff.egg-info/dependency_links.txt
+sonata_lidiff.egg-info/entry_points.txt
+sonata_lidiff.egg-info/requires.txt
+sonata_lidiff.egg-info/top_level.txt

@@ -1,0 +1,37 @@
+# Core Dependencies
+torch>=2.0.0
+torchvision>=0.15.0
+numpy>=1.21.0,<1.28  # Open3D requires numpy <2.0; 1.26.4 works with scipy 1.11.4
+scipy==1.11.4  # Pinned: 1.13.x causes TypeError with Open3D/scipy.interpolate
+
+# Sparse Convolution (for Sonata encoder only - diffusion module uses transformer blocks)
+# Note: The diffusion module now uses Sonata-style transformer blocks instead of sparse convolutions
+#       spconv is only needed for the Sonata encoder (loaded from HuggingFace)
+#       For CUDA 13, try spconv-cu124 first (backward compatibility), 
+#       or build from source: git clone https://github.com/traveller59/spconv.git
+spconv-cu124  # Adjust CUDA version as needed (cu118, cu121, cu124)
+
+# Point Cloud Processing
+open3d>=0.16.0
+
+# For Sonata Encoder
+# torch-scatter: install via install_dependencies.sh (PyG wheel matching PyTorch; conda build can ABI-mismatch)
+flash-attn>=2.0.0  # Optional but recommended
+huggingface_hub
+timm
+
+# Data Processing
+pyyaml>=5.4.0
+h5py>=3.0.0
+
+# Training & Logging
+tensorboard>=2.8.0
+tqdm>=4.60.0
+matplotlib>=3.3.0
+pillow>=8.0.0
+
+# Evaluation
+scikit-learn>=0.24.0
+
+# Utilities
+psutil

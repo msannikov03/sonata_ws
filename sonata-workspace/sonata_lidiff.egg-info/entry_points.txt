@@ -1,0 +1,2 @@
+[console_scripts]
+train-sonata-lidiff = training.train_diffusion:main
