@@ -302,14 +302,21 @@ class SonataTransformerBlock(nn.Module):
         return out
     
     def _find_neighbors(self, coords: torch.Tensor) -> torch.Tensor:
-        """Find k-nearest neighbors for each point."""
-        coords_np = coords.detach().cpu().numpy()
-        tree = cKDTree(coords_np)
-        _, indices = tree.query(coords_np, k=min(self.num_neighbors + 1, len(coords)))
-        # Remove self (first neighbor)
-        if indices.ndim == 2:
-            indices = indices[:, 1:]
-        return torch.from_numpy(indices).to(coords.device)
+        """Find k-nearest neighbors for each point using GPU."""
+        N = coords.shape[0]
+        k = min(self.num_neighbors + 1, N)
+        chunk_size = 4096
+        all_indices = []
+        for start in range(0, N, chunk_size):
+            end = min(start + chunk_size, N)
+            dists = torch.cdist(coords[start:end].unsqueeze(0), coords.unsqueeze(0)).squeeze(0)
+            _, idx = dists.topk(k, dim=-1, largest=False)
+            all_indices.append(idx[:, 1:])
+        result = torch.cat(all_indices, dim=0)
+        if result.shape[1] < self.num_neighbors:
+            pad = result[:, -1:].expand(-1, self.num_neighbors - result.shape[1])
+            result = torch.cat([result, pad], dim=1)
+        return result
     
     def _local_attention(
         self,
@@ -538,13 +545,14 @@ class DenoisingNetwork(nn.Module):
         coords: torch.Tensor,
         target_coords: torch.Tensor
     ) -> torch.Tensor:
-        """Upsample features to target coordinates using nearest neighbor interpolation."""
-        # Find nearest neighbors
-        coords_np = coords.detach().cpu().numpy()
-        target_np = target_coords.detach().cpu().numpy()
-        tree = cKDTree(coords_np)
-        _, indices = tree.query(target_np, k=1)
-        indices = torch.from_numpy(indices).long().to(features.device)
+        """Upsample features to target coordinates using GPU nearest neighbor."""
+        chunk_size = 4096
+        all_indices = []
+        for start in range(0, target_coords.shape[0], chunk_size):
+            end = min(start + chunk_size, target_coords.shape[0])
+            dists = torch.cdist(target_coords[start:end].unsqueeze(0), coords.unsqueeze(0)).squeeze(0)
+            all_indices.append(dists.argmin(dim=-1))
+        indices = torch.cat(all_indices, dim=0)
         return features[indices]
     
     def forward(

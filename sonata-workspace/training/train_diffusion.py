@@ -173,19 +173,27 @@ def build_model(args):
                     batch_size = 1
                 t = torch.randint(0, self.scheduler.num_timesteps,
                                   (batch_size,), device=complete_scan.device)
-                noise = torch.randn_like(complete_scan)
-                if complete_batch is not None:
-                    t_pp = t[complete_batch]
-                else:
-                    t_pp = t.expand(complete_scan.shape[0])
-                dev = complete_scan.device
-                sa = self.scheduler.sqrt_alphas_cumprod.to(dev)[t_pp].unsqueeze(-1)
-                som = self.scheduler.sqrt_one_minus_alphas_cumprod.to(dev)[t_pp].unsqueeze(-1)
-                noisy = sa * complete_scan + som * noise
-                pred = self.denoiser(noisy, complete_scan, t, {'features': cond})
+                total_loss_val = 0.0
+                for b in range(batch_size):
+                    if complete_batch is not None:
+                        mask = complete_batch == b
+                        coords_b = complete_scan[mask]
+                        cond_b = cond[mask]
+                    else:
+                        coords_b = complete_scan
+                        cond_b = cond
+                    noise_b = torch.randn_like(coords_b)
+                    dev = coords_b.device
+                    sa = self.scheduler.sqrt_alphas_cumprod.to(dev)[t[b]]
+                    som = self.scheduler.sqrt_one_minus_alphas_cumprod.to(dev)[t[b]]
+                    noisy_b = sa * coords_b + som * noise_b
+                    pred_b = self.denoiser(noisy_b, coords_b, t[b:b+1], {'features': cond_b})
+                    sample_loss = F.mse_loss(pred_b, noise_b) / batch_size
+                    sample_loss.backward()
+                    total_loss_val += sample_loss.item()
                 if return_loss:
-                    return {'loss': F.mse_loss(pred, noise), 'pred_noise': pred}
-                return {'pred_noise': pred}
+                    return {'loss': total_loss_val, 'pred_noise': None}
+                return {'pred_noise': None}
 
         denoiser = DenoisingNetwork(
             in_channels=3, condition_dim=256,
@@ -284,11 +292,13 @@ def train_epoch(
                        return_loss=True, condition_features=cond_feat)
         loss = output['loss']
 
-        # Scale loss for gradient accumulation
-        loss = loss / args.accumulation_steps
-
-        # Backward pass
-        loss.backward()
+        # Backward already done per-sample if loss is float
+        if isinstance(loss, torch.Tensor):
+            loss = loss / args.accumulation_steps
+            loss.backward()
+            loss_val = loss.item() * args.accumulation_steps
+        else:
+            loss_val = loss
 
         # Update weights
         if (i + 1) % args.accumulation_steps == 0:
@@ -301,12 +311,12 @@ def train_epoch(
             optimizer.zero_grad()
 
         # Logging
-        total_loss += loss.item() * args.accumulation_steps
-        pbar.set_postfix({'loss': loss.item() * args.accumulation_steps})
+        total_loss += loss_val
+        pbar.set_postfix({'loss': loss_val})
 
         # TensorBoard logging
         step = epoch * len(dataloader) + i
-        writer.add_scalar('train/loss', loss.item(), step)
+        writer.add_scalar('train/loss', loss_val, step)
 
     avg_loss = total_loss / len(dataloader)
     return avg_loss
@@ -357,7 +367,7 @@ def validate(
                        return_loss=True, condition_features=cond_feat)
         loss = output['loss']
 
-        total_loss += loss.item()
+        total_loss += loss if isinstance(loss, float) else loss.item()
         pbar.set_postfix({'loss': loss.item()})
 
     avg_loss = total_loss / len(dataloader)

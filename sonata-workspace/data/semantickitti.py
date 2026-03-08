@@ -349,15 +349,15 @@ class SemanticKITTI(Dataset):
         # Compute voxel centers
         voxel_centers = unique_voxels * self.voxel_size + self.voxel_size / 2
         
-        # Majority vote for labels
+        # Majority vote for labels (vectorized)
         voxel_labels = np.zeros(unique_voxels.shape[0], dtype=np.int32)
-        for i in range(unique_voxels.shape[0]):
-            mask = inverse_indices == i
-            if mask.sum() > 0:
-                # Most common label
-                voxel_labels[i] = np.bincount(
-                    labels[mask]
-                ).argmax()
+        if labels.any():
+            # Use vectorized bincount per voxel
+            num_voxels = unique_voxels.shape[0]
+            num_classes = int(labels.max()) + 1
+            counts = np.zeros((num_voxels, num_classes), dtype=np.int32)
+            np.add.at(counts, (inverse_indices, labels), 1)
+            voxel_labels = counts.argmax(axis=1).astype(np.int32)
         
         return voxel_centers, voxel_labels
     
