@@ -189,7 +189,8 @@ def build_model(args):
                     noisy_b = sa * coords_b + som * noise_b
                     pred_b = self.denoiser(noisy_b, coords_b, t[b:b+1], {'features': cond_b})
                     sample_loss = F.mse_loss(pred_b, noise_b) / batch_size
-                    sample_loss.backward()
+                    if sample_loss.requires_grad:
+                        sample_loss.backward()
                     total_loss_val += sample_loss.item()
                 if return_loss:
                     return {'loss': total_loss_val, 'pred_noise': None}
@@ -368,7 +369,7 @@ def validate(
         loss = output['loss']
 
         total_loss += loss if isinstance(loss, float) else loss.item()
-        pbar.set_postfix({'loss': loss.item()})
+        pbar.set_postfix({'loss': loss if isinstance(loss, float) else loss.item()})
 
     avg_loss = total_loss / len(dataloader)
 
