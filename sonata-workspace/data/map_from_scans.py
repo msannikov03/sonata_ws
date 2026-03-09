@@ -186,7 +186,7 @@ def generate_sequence_map(
         os.makedirs(gt_seq_dir, exist_ok=True)
 
         # Save world-frame map once (for reference)
-        np.savez(
+        np.savez_compressed(
             os.path.join(gt_seq_dir, "map_world.npz"),
             points=map_voxel.astype(np.float32),
         )
@@ -201,7 +201,7 @@ def generate_sequence_map(
             map_scan_frame = (pose_inv @ map_homo.T).T[:, :3]
 
             scan_id = scan_file.replace(".bin", "")
-            np.savez(
+            np.savez_compressed(
                 os.path.join(gt_seq_dir, f"{scan_id}.npz"),
                 points=map_scan_frame.astype(np.float32),
             )
