@@ -75,15 +75,50 @@ def voxelize_open3d(points: np.ndarray, voxel_size: float) -> np.ndarray:
     return np.asarray(down.points, dtype=np.float32)
 
 
-def voxelize_torch(points: np.ndarray, voxel_size: float, device: str = "cuda") -> np.ndarray:
-    """Voxelize on GPU using PyTorch (fast for large point clouds)."""
+def _voxel_centers_merge_duplicates(centers: np.ndarray, voxel_size: float) -> np.ndarray:
+    """Merge duplicate voxel centers (e.g. after chunked voxelization)."""
+    coords = np.floor(centers / voxel_size).astype(np.int32)
+    unique_coords = np.unique(coords, axis=0)
+    return (unique_coords.astype(np.float32) * voxel_size + voxel_size / 2).astype(np.float32)
+
+
+def voxelize_torch(
+    points: np.ndarray,
+    voxel_size: float,
+    device: str = "cuda",
+    chunk_size: int = 60_000_000,
+) -> np.ndarray:
+    """Voxelize on GPU using PyTorch in chunks to reduce memory usage."""
     import torch
     dev = torch.device(device if torch.cuda.is_available() else "cpu")
-    pts = torch.from_numpy(points.astype(np.float32)).to(dev)
-    coords = (pts / voxel_size).floor().long()
-    unique_coords = torch.unique(coords, dim=0)
-    centers = unique_coords.float() * voxel_size + voxel_size / 2
-    return centers.cpu().numpy().astype(np.float32)
+    n_points = points.shape[0]
+    if n_points == 0:
+        return np.zeros((0, 3), dtype=np.float32)
+
+    n_chunks = (n_points + chunk_size - 1) // chunk_size
+    all_centers = []
+    for start in tqdm(
+        range(0, n_points, chunk_size),
+        total=n_chunks,
+        desc="Voxelize (chunks)",
+        unit="chunk",
+        leave=False,
+    ):
+        end = min(start + chunk_size, n_points)
+        chunk = points[start:end].astype(np.float32)
+        pts = torch.from_numpy(chunk).to(dev, non_blocking=True)
+        # int32 instead of int64 to save GPU memory
+        coords = (pts / voxel_size).floor().to(torch.int32)
+        del pts
+        unique_coords = torch.unique(coords, dim=0)
+        del coords
+        centers = unique_coords.float() * voxel_size + voxel_size / 2
+        del unique_coords
+        all_centers.append(centers.cpu().numpy())
+        if dev.type == "cuda":
+            torch.cuda.empty_cache()
+    merged = np.vstack(all_centers)
+    return _voxel_centers_merge_duplicates(merged, voxel_size)
 
 
 def voxelize(points: np.ndarray, voxel_size: float, backend: str = "numpy") -> np.ndarray:
