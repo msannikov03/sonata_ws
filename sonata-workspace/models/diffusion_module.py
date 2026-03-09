@@ -302,14 +302,21 @@ class SonataTransformerBlock(nn.Module):
         return out
     
     def _find_neighbors(self, coords: torch.Tensor) -> torch.Tensor:
-        """Find k-nearest neighbors for each point."""
-        coords_np = coords.detach().cpu().numpy()
-        tree = cKDTree(coords_np)
-        _, indices = tree.query(coords_np, k=min(self.num_neighbors + 1, len(coords)))
-        # Remove self (first neighbor)
-        if indices.ndim == 2:
-            indices = indices[:, 1:]
-        return torch.from_numpy(indices).to(coords.device)
+        """Find k-nearest neighbors for each point using GPU."""
+        N = coords.shape[0]
+        k = min(self.num_neighbors + 1, N)
+        chunk_size = 4096
+        all_indices = []
+        for start in range(0, N, chunk_size):
+            end = min(start + chunk_size, N)
+            dists = torch.cdist(coords[start:end].unsqueeze(0), coords.unsqueeze(0)).squeeze(0)
+            _, idx = dists.topk(k, dim=-1, largest=False)
+            all_indices.append(idx[:, 1:])
+        result = torch.cat(all_indices, dim=0)
+        if result.shape[1] < self.num_neighbors:
+            pad = result[:, -1:].expand(-1, self.num_neighbors - result.shape[1])
+            result = torch.cat([result, pad], dim=1)
+        return result
     
     def _local_attention(
         self,
@@ -490,6 +497,12 @@ class DenoisingNetwork(nn.Module):
                 )
             )
         
+
+        # Projections between levels (dimension transitions)
+        self.level_up = nn.ModuleList()
+        for i in range(len(hidden_dims) - 1):
+            self.level_up.append(nn.Linear(hidden_dims[i], hidden_dims[i + 1]))
+
         # Bottleneck
         self.bottleneck = PointwiseDiffusionBlock(
             hidden_dims[-1], hidden_dims[-1],
@@ -532,13 +545,14 @@ class DenoisingNetwork(nn.Module):
         coords: torch.Tensor,
         target_coords: torch.Tensor
     ) -> torch.Tensor:
-        """Upsample features to target coordinates using nearest neighbor interpolation."""
-        # Find nearest neighbors
-        coords_np = coords.detach().cpu().numpy()
-        target_np = target_coords.detach().cpu().numpy()
-        tree = cKDTree(coords_np)
-        _, indices = tree.query(target_np, k=1)
-        indices = torch.from_numpy(indices).long().to(features.device)
+        """Upsample features to target coordinates using GPU nearest neighbor."""
+        chunk_size = 4096
+        all_indices = []
+        for start in range(0, target_coords.shape[0], chunk_size):
+            end = min(start + chunk_size, target_coords.shape[0])
+            dists = torch.cdist(target_coords[start:end].unsqueeze(0), coords.unsqueeze(0)).squeeze(0)
+            all_indices.append(dists.argmin(dim=-1))
+        indices = torch.cat(all_indices, dim=0)
         return features[indices]
     
     def forward(
@@ -569,41 +583,55 @@ class DenoisingNetwork(nn.Module):
         # Input projection
         x = self.input_proj(features)
         x_coords = coords
+        x_cond = cond_feat
         
         # Encoder path
         skip_features = []
         skip_coords = []
+        skip_conds = []
         
         for i, enc_block in enumerate(self.encoder_blocks):
-            # Process with transformer
-            x = enc_block(x, x_coords, t_embed, cond_feat)
-            
+            # Process with transformer at current level
+            x = enc_block(x, x_coords, t_embed, x_cond)
+
             # Save skip connection
             skip_features.append(x)
             skip_coords.append(x_coords)
-            
-            # Downsample for next level
-            if i < len(self.encoder_blocks) - 1:
-                target_num = x.shape[0] // 2
-                x, x_coords = self._downsample_points(x, x_coords, target_num)
-        
+            skip_conds.append(x_cond)
+
+            # Downsample and project to next level dimension
+            target_num = x.shape[0] // 2
+            N = x.shape[0]
+            if N > target_num:
+                indices = torch.linspace(
+                    0, N - 1, target_num, dtype=torch.long,
+                    device=x.device
+                )
+                x = x[indices]
+                x_coords = x_coords[indices]
+                x_cond = x_cond[indices]
+            # Project to next level dimension
+            x = self.level_up[i](x)
+
         # Bottleneck
-        x = self.bottleneck(x, x_coords, t_embed, cond_feat)
+        x = self.bottleneck(x, x_coords, t_embed, x_cond)
         
         # Decoder path
         for i, dec_block in enumerate(self.decoder_blocks):
             # Upsample to match skip connection
             skip_feat = skip_features[-(i+1)]
             skip_coord = skip_coords[-(i+1)]
+            skip_cond = skip_conds[-(i+1)]
             
             x = self._upsample_points(x, x_coords, skip_coord)
             x_coords = skip_coord
+            x_cond = skip_cond
             
             # Concatenate skip connection
             x = torch.cat([x, skip_feat], dim=-1)
             
             # Process with transformer
-            x = dec_block(x, x_coords, t_embed, cond_feat)
+            x = dec_block(x, x_coords, t_embed, x_cond)
         
         # Output projection
         noise_pred = self.output_proj(x)
@@ -641,6 +669,17 @@ class SinusoidalTimeEmbedding(nn.Module):
         ], dim=-1)
         
         return embeddings
+
+
+
+def knn_interpolate(features, source_coords, target_coords):
+    """Map features from source points to target points via nearest neighbor."""
+    src_np = source_coords.detach().cpu().numpy()
+    tgt_np = target_coords.detach().cpu().numpy()
+    tree = cKDTree(src_np)
+    _, indices = tree.query(tgt_np, k=1)
+    indices = torch.from_numpy(indices.astype(np.int64)).to(features.device)
+    return features[indices]
 
 
 class SceneCompletionDiffusion(nn.Module):
@@ -695,7 +734,9 @@ class SceneCompletionDiffusion(nn.Module):
         self,
         partial_scan: Dict[str, torch.Tensor],
         complete_scan: torch.Tensor,
-        return_loss: bool = True
+        complete_batch: torch.Tensor = None,
+        return_loss: bool = True,
+        condition_features: torch.Tensor = None,
     ) -> Dict[str, torch.Tensor]:
         """
         Training forward pass.
@@ -708,33 +749,47 @@ class SceneCompletionDiffusion(nn.Module):
         Returns:
             Dictionary with predictions and losses
         """
-        # Extract conditional features from partial scan
-        cond_features, _ = self.condition_extractor(partial_scan)
+        if condition_features is not None:
+            # Use pre-mapped condition features (from precomputed data)
+            cond_mapped = condition_features
+        else:
+            # Extract conditional features and map to complete_scan coords
+            cond_features, _ = self.condition_extractor(partial_scan)
+            cond_mapped = knn_interpolate(
+                cond_features, partial_scan['coord'], complete_scan
+            )
         
-        # Get coordinates from partial scan
-        coords = partial_scan['coord']
-        
-        # Sample random timesteps
-        batch_size = 1  # Assume single batch
+        # Handle batched data
+        if complete_batch is not None:
+            batch_size = complete_batch.max().item() + 1
+        else:
+            batch_size = 1
+
         t = torch.randint(
-            0, self.scheduler.num_timesteps, 
+            0, self.scheduler.num_timesteps,
             (batch_size,), device=complete_scan.device
         )
-        
-        # Add noise to complete scan
+
+        # Per-point noise scaling for batched data
         noise = torch.randn_like(complete_scan)
-        noisy_scan = self.scheduler.q_sample(complete_scan, t, noise)
-        
-        # Predict noise
+        if complete_batch is not None:
+            t_per_point = t[complete_batch]
+        else:
+            t_per_point = t.expand(complete_scan.shape[0])
+
+        dev = complete_scan.device
+        sa = self.scheduler.sqrt_alphas_cumprod.to(dev)[t_per_point].unsqueeze(-1)
+        som = self.scheduler.sqrt_one_minus_alphas_cumprod.to(dev)[t_per_point].unsqueeze(-1)
+        noisy_scan = sa * complete_scan + som * noise
+
+        # Predict noise using complete_scan coordinates
         pred_noise = self.denoiser(
-            noisy_scan, coords, t, {'features': cond_features}
+            noisy_scan, complete_scan, t, {'features': cond_mapped}
         )
-        
-        # Compute loss
+
         if return_loss:
             loss = F.mse_loss(pred_noise, noise)
             return {'loss': loss, 'pred_noise': pred_noise}
-        
         return {'pred_noise': pred_noise}
     
     @torch.no_grad()

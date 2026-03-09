@@ -78,6 +78,7 @@ class SemanticKITTI(Dataset):
         use_ground_truth_maps: bool = True,
         augmentation: bool = True,
         num_points_per_scan: Optional[int] = None,
+        use_precomputed: bool = False,
     ):
         """
         Initialize SemanticKITTI dataset.
@@ -100,6 +101,7 @@ class SemanticKITTI(Dataset):
         self.use_ground_truth_maps = use_ground_truth_maps
         self.augmentation = augmentation
         self.num_points_per_scan = num_points_per_scan
+        self.use_precomputed = use_precomputed
         
         # Get sequences for this split
         self.sequences = self.SPLITS[split]
@@ -111,6 +113,16 @@ class SemanticKITTI(Dataset):
         self.gt_map_files = []
         
         self._build_file_lists()
+
+        # Filter to only samples with existing precomputed features
+        if self.use_precomputed:
+            valid = [i for i, p in enumerate(self.precomputed_files) if os.path.exists(p)]
+            self.scan_files = [self.scan_files[i] for i in valid]
+            self.label_files = [self.label_files[i] for i in valid]
+            self.pose_files = [self.pose_files[i] for i in valid]
+            if self.use_ground_truth_maps:
+                self.gt_map_files = [self.gt_map_files[i] for i in valid]
+            self.precomputed_files = [self.precomputed_files[i] for i in valid]
         
         print(f"Loaded SemanticKITTI {split} split:")
         print(f"  Sequences: {self.sequences}")
@@ -149,6 +161,13 @@ class SemanticKITTI(Dataset):
                     )
                     self.gt_map_files.append(gt_map_path)
                 
+                if not hasattr(self, "precomputed_files"):
+                    self.precomputed_files = []
+                precomp_path = os.path.join(
+                    self.root, "precomputed_v2", seq, f"{scan_id}.npz"
+                )
+                self.precomputed_files.append(precomp_path)
+
                 self.scan_files.append(scan_path)
                 self.label_files.append(label_path)
                 self.pose_files.append(pose_path)
@@ -167,6 +186,28 @@ class SemanticKITTI(Dataset):
                 - semantic_labels: Semantic class labels
                 - metadata: Additional information
         """
+        # Fast path: load precomputed_v2 data
+        if self.use_precomputed and hasattr(self, "precomputed_files"):
+            precomp_path = self.precomputed_files[idx]
+            if os.path.exists(precomp_path):
+                precomp = np.load(precomp_path)
+                cc = precomp["complete_coord"].astype(np.float32)
+                cl = precomp["complete_labels"].astype(np.int64)
+                cf = precomp["condition_features"]
+                sc = precomp["scan_center"].astype(np.float32)
+                return {
+                    "partial_coord": torch.zeros(1, 3),
+                    "partial_color": torch.zeros(1, 3),
+                    "partial_normal": torch.zeros(1, 3),
+                    "partial_labels": torch.zeros(1, dtype=torch.long),
+                    "complete_coord": torch.from_numpy(cc),
+                    "complete_color": torch.zeros(len(cc), 3),
+                    "complete_labels": torch.from_numpy(cl),
+                    "scan_center": torch.from_numpy(sc),
+                    "condition_features": torch.from_numpy(cf.copy()),
+                    "idx": idx,
+                }
+
         # Load scan
         scan = self._load_scan(self.scan_files[idx])
         
@@ -203,7 +244,8 @@ class SemanticKITTI(Dataset):
         
         # Voxelize
         scan_voxel, scan_labels = self._voxelize(scan, labels)
-        gt_voxel, gt_labels = self._voxelize(gt_complete, labels)
+        gt_labels_dummy = np.zeros(gt_complete.shape[0], dtype=np.int32)
+        gt_voxel, gt_labels = self._voxelize(gt_complete, gt_labels_dummy)
         
         # Limit number of points
         if scan_voxel.shape[0] > self.max_points:
@@ -307,15 +349,15 @@ class SemanticKITTI(Dataset):
         # Compute voxel centers
         voxel_centers = unique_voxels * self.voxel_size + self.voxel_size / 2
         
-        # Majority vote for labels
+        # Majority vote for labels (vectorized)
         voxel_labels = np.zeros(unique_voxels.shape[0], dtype=np.int32)
-        for i in range(unique_voxels.shape[0]):
-            mask = inverse_indices == i
-            if mask.sum() > 0:
-                # Most common label
-                voxel_labels[i] = np.bincount(
-                    labels[mask]
-                ).argmax()
+        if labels.any():
+            # Use vectorized bincount per voxel
+            num_voxels = unique_voxels.shape[0]
+            num_classes = int(labels.max()) + 1
+            counts = np.zeros((num_voxels, num_classes), dtype=np.int32)
+            np.add.at(counts, (inverse_indices, labels), 1)
+            voxel_labels = counts.argmax(axis=1).astype(np.int32)
         
         return voxel_centers, voxel_labels
     
@@ -420,6 +462,12 @@ def collate_fn(batch: List[Dict]) -> Dict[str, torch.Tensor]:
         'scan_center': torch.stack([d['scan_center'] for d in batch]),
         'idx': torch.tensor([d['idx'] for d in batch]),
     }
+
+    # Add condition_features if present (from precomputed data)
+    if 'condition_features' in batch[0]:
+        batch_data['condition_features'] = torch.cat(
+            [d['condition_features'] for d in batch], dim=0
+        )
     
     return batch_data
 

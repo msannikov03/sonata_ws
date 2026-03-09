@@ -48,14 +48,12 @@ class SonataEncoder(nn.Module):
             pretrained, enable_flash, custom_config
         )
         
-        # Feature dimensions at each level
-        self.feature_dims = {
-            0: 384,  # Input level
-            1: 384,  # After first pooling
-            2: 384,  # After second pooling
-            3: 384,  # After third pooling
-            4: 384,  # After fourth pooling
-        }
+        # Feature dimensions at each level (read from model config)
+        # PTv3 enc_channels default: (48, 96, 192, 384, 512)
+        enc_channels = getattr(self.encoder, "enc_channels", None)
+        if enc_channels is None:
+            enc_channels = (48, 96, 192, 384, 512)
+        self.feature_dims = {i: c for i, c in enumerate(enc_channels)}
         
         if freeze:
             self._freeze_encoder()
@@ -80,7 +78,7 @@ class SonataEncoder(nn.Module):
             
             if not enable_flash:
                 custom_config['enable_flash'] = False
-                custom_config['enc_patch_size'] = [512] * 5  # Reduce patch size
+                custom_config['enc_patch_size'] = [128] * 5  # Reduced for 24GB GPU
             
             # Import Sonata model
             try:
@@ -140,9 +138,22 @@ class SonataEncoder(nn.Module):
                 - coords: Coordinates at each level
                 - point: Final encoded point cloud
         """
+        # Prepare input: construct feat from available keys
+        import copy
+        prepared = copy.copy(point_dict)
+        if 'feat' not in prepared:
+            feat_parts = [prepared['coord']]
+            if 'color' in prepared:
+                feat_parts.append(prepared['color'])
+            if 'normal' in prepared:
+                feat_parts.append(prepared['normal'])
+            prepared['feat'] = torch.cat(feat_parts, dim=-1)
+        if 'grid_size' not in prepared and 'grid_coord' not in prepared:
+            prepared['grid_size'] = 0.02
+
         # Encode point cloud through hierarchical levels
         with torch.set_grad_enabled(not self.freeze):
-            point = self.encoder(point_dict)
+            point = self.encoder(prepared)
         
         if not return_all_levels:
             # Return only final level features
