@@ -35,7 +35,6 @@ def parse_calibration(filename: str) -> dict:
             calib[key.strip()] = pose
     return calib
 
-
 def load_poses(calib_path: str, poses_path: str) -> list:
     """Load poses and apply calibration if available."""
     poses = []
