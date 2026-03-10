@@ -39,8 +39,9 @@ def parse_calibration(filename: str) -> dict:
 def load_poses(calib_path: str, poses_path: str) -> list:
     """Load poses and apply calibration if available."""
     poses = []
+
     with open(poses_path) as f:
-        for line in f:
+        for line in tqdm(f, desc="Loading poses", unit="pose"):
             values = [float(v) for v in line.strip().split()]
             pose = np.eye(4)
             pose[0, :4] = values[0:4]
@@ -55,6 +56,7 @@ def load_poses(calib_path: str, poses_path: str) -> list:
                     pose = Tr_inv @ pose @ Tr
 
             poses.append(pose)
+
     return poses
 
 
@@ -221,7 +223,7 @@ def generate_sequence_map(
         os.makedirs(gt_seq_dir, exist_ok=True)
 
         # Save world-frame map once (for reference)
-        np.savez_compressed(
+        np.savez(
             os.path.join(gt_seq_dir, "map_world.npz"),
             points=map_voxel.astype(np.float32),
         )
@@ -236,7 +238,7 @@ def generate_sequence_map(
             map_scan_frame = (pose_inv @ map_homo.T).T[:, :3]
 
             scan_id = scan_file.replace(".bin", "")
-            np.savez_compressed(
+            np.savez(
                 os.path.join(gt_seq_dir, f"{scan_id}.npz"),
                 points=map_scan_frame.astype(np.float32),
             )
