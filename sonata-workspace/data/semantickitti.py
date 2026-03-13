@@ -203,7 +203,10 @@ class SemanticKITTI(Dataset):
         
         # Voxelize
         scan_voxel, scan_labels = self._voxelize(scan, labels)
-        gt_voxel, gt_labels = self._voxelize(gt_complete, labels)
+        # GT map has different point count than scan labels — use zero labels
+        # (complete_labels is not used by diffusion or refinement training)
+        gt_point_labels = np.zeros(gt_complete.shape[0], dtype=np.int32)
+        gt_voxel, gt_labels = self._voxelize(gt_complete, gt_point_labels)
         
         # Limit number of points
         if scan_voxel.shape[0] > self.max_points:
