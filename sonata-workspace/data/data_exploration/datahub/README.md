@@ -96,13 +96,13 @@ The only difference is scope and storage location.
 ## Installation
 
 ```bash
-pip install fsspec pyarrow s3fs
+pip install fsspec pyarrow s3fs universal_pathlib
 ```
 
 If you use local cache:
 
 ```bash
-pip install fsspec pyarrow s3fs filecache
+pip install fsspec pyarrow s3fs filecache universal_pathlib
 ```
 
 ---

@@ -2,9 +2,9 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Iterable
 
 import fsspec
+from upath import UPath
 
 from .model import Dataset
 from .storage import Storage
@@ -13,18 +13,18 @@ from .storage import Storage
 @dataclass(frozen=True, slots=True)
 class Hub:
     storage: Storage
-    root: str
+    root: UPath
 
     def dataset(self, name: str) -> Dataset:
-        return Dataset(self.storage, f"{self.root}/{name}", name)
+        return Dataset(self.storage, self.root / name, name)
 
     def list_datasets(self) -> list[str]:
-        base = self.root.rstrip("/")
+        base = self.root
         if not self.storage.exists(base):
             return []
         out = []
         for p in self.storage.listdir(base):
-            name = p.rsplit("/", 1)[-1]
+            name = p.name
             if name and self.storage.isdir(p):
                 out.append(name)
         return sorted(out)
@@ -32,7 +32,7 @@ class Hub:
 
 def open_hub(
     *,
-    root: str = "3d-scenes/datasets",
+    root: str | UPath = "3d-scenes/datasets",
     endpoint_url: str = "https://storage.yandexcloud.net",
     cache_storage: str | None = None,
     target_protocol: str = "s3",
@@ -48,4 +48,4 @@ def open_hub(
         )
     else:
         fs = fsspec.filesystem(target_protocol, **opts)
-    return Hub(Storage(fs), root.rstrip("/"))
+    return Hub(Storage(fs), UPath(str(root).rstrip("/")))
