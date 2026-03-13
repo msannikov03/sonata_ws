@@ -75,6 +75,7 @@ The library exposes a small domain model:
 * `Sequence`
 * `Asset`
 * `Batch`
+* `FrameRef`
 
 Semantics:
 
@@ -85,6 +86,7 @@ Semantics:
   * scene-scoped assets under `maps/`
 * an **asset** contains parquet batches
 * a **batch** is the final readable object
+* a **frame** is a filtered view over one batch
 
 Both sequence data and map data are represented as `Asset`.
 The only difference is scope and storage location.
@@ -124,6 +126,9 @@ batch = seq_asset.batch(11)
 
 print(batch.num_rows)
 table = batch.read_table()
+
+frame = seq_asset.frame(123)
+frame_table = frame.read_table()
 ```
 
 Scene-level asset:
@@ -230,6 +235,40 @@ xyz = batch.read_columns(["x", "y", "z"])
 
 ---
 
+### Access frame in sequence asset
+
+Sequence assets may expose frame-level access via `frame_id`.
+
+Invariants:
+
+* `frame_id` is integer
+* each frame belongs to exactly one batch
+* a frame is never split across batches
+
+API:
+
+```python
+asset = scene.sequence("00").asset("lidar.velodyne")
+
+frame = asset.frame(123)
+table = frame.read_table()
+df = frame.read_pandas()
+
+batch = asset.batch_for_frame(123)
+frames = asset.batch(11).list_frames()
+```
+
+You can also iterate:
+
+```python
+for frame in asset.frames():
+    print(frame.frame_id, frame.batch_path)
+```
+
+`FrameRef.read_table()` reads only rows with this `frame_id` inside its batch.
+
+---
+
 ## Design principles
 
 ### 1. Storage-first model
@@ -240,6 +279,12 @@ This keeps the system predictable:
 
 ```python
 hub.dataset("semantic_kitti").scene("01").sequence("00").asset("lidar.velodyne").batch(11)
+```
+
+Frame access stays on top of the same storage model:
+
+```python
+hub.dataset("semantic_kitti").scene("01").sequence("00").asset("lidar.velodyne").frame(123)
 ```
 
 ---
@@ -387,6 +432,7 @@ This project currently provides:
 * S3-compatible access via `fsspec`
 * optional local file cache
 * uniform sequence/map asset model
+* optional frame-level access for sequence assets
 
 It intentionally does not yet provide:
 
