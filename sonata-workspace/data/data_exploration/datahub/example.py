@@ -12,6 +12,8 @@ scene = ds.scene("01")
 seq_asset = scene.sequence("00").asset("lidar.velodyne")
 b = seq_asset.batch(11)
 print(b.num_rows)
+print(seq_asset.batch_for_frame(123).name)
+print(seq_asset.frame(123).read_table())
 
 map_asset = scene.map("lidar_pointcloud")
 print(map_asset.list_batches()[:3])
