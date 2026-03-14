@@ -74,7 +74,7 @@ class SemanticKITTI(Dataset):
         root: str,
         split: str = 'train',
         voxel_size: float = 0.05,
-        max_points: int = 50000,
+        max_points: int = 20000,
         use_ground_truth_maps: bool = True,
         augmentation: bool = True,
         num_points_per_scan: Optional[int] = None,
