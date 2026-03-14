@@ -100,6 +100,11 @@ def parse_args():
         help='Gradient accumulation steps'
     )
 
+    parser.add_argument(
+        '--fp16', action='store_true',
+        help='Use mixed precision training (fp16)'
+    )
+
     # Output
     parser.add_argument(
         '--output_dir', type=str, default='checkpoints/diffusion',
@@ -216,15 +221,15 @@ def build_model(args):
         pretrained=args.encoder_ckpt,
         freeze=args.freeze_encoder,
         enable_flash=args.enable_flash,
-        feature_levels=[2, 3, 4]
+        feature_levels=[0]
     )
 
     # Conditional feature extractor
     print("Building conditional feature extractor...")
     condition_extractor = ConditionalFeatureExtractor(
         encoder,
-        feature_levels=[2, 3, 4],
-        fusion_type="attention"
+        feature_levels=[0],
+        fusion_type="concat"
     )
 
     # Complete diffusion model
@@ -254,7 +259,8 @@ def train_epoch(
     optimizer: optim.Optimizer,
     epoch: int,
     args,
-    writer: SummaryWriter
+    writer: SummaryWriter,
+    scaler: torch.cuda.amp.GradScaler = None,
 ) -> float:
     """Train for one epoch."""
 
@@ -288,27 +294,39 @@ def train_epoch(
             if cond_feat.dtype == torch.float16:
                 cond_feat = cond_feat.float()
 
-        # Forward pass
-        output = model(partial_scan, complete_coord, complete_batch,
-                       return_loss=True, condition_features=cond_feat)
-        loss = output['loss']
+        # Forward pass (with optional mixed precision)
+        with torch.cuda.amp.autocast(enabled=getattr(args, 'fp16', False)):
+            output = model(partial_scan, complete_coord, complete_batch,
+                           return_loss=True, condition_features=cond_feat)
+            loss = output['loss']
 
-        # Backward already done per-sample if loss is float
+        # Backward (with optional mixed precision)
         if isinstance(loss, torch.Tensor):
             loss = loss / args.accumulation_steps
-            loss.backward()
+            if scaler is not None:
+                scaler.scale(loss).backward()
+            else:
+                loss.backward()
             loss_val = loss.item() * args.accumulation_steps
         else:
             loss_val = loss
 
         # Update weights
         if (i + 1) % args.accumulation_steps == 0:
-            # Gradient clipping
-            if args.gradient_clip > 0:
-                torch.nn.utils.clip_grad_norm_(
-                    model.parameters(), args.gradient_clip
-                )
-            optimizer.step()
+            if scaler is not None:
+                if args.gradient_clip > 0:
+                    scaler.unscale_(optimizer)
+                    torch.nn.utils.clip_grad_norm_(
+                        model.parameters(), args.gradient_clip
+                    )
+                scaler.step(optimizer)
+                scaler.update()
+            else:
+                if args.gradient_clip > 0:
+                    torch.nn.utils.clip_grad_norm_(
+                        model.parameters(), args.gradient_clip
+                    )
+                optimizer.step()
             optimizer.zero_grad()
 
         # Logging
@@ -363,10 +381,11 @@ def validate(
             if cond_feat.dtype == torch.float16:
                 cond_feat = cond_feat.float()
 
-        # Forward pass
-        output = model(partial_scan, complete_coord, complete_batch,
-                       return_loss=True, condition_features=cond_feat)
-        loss = output['loss']
+        # Forward pass (with optional mixed precision)
+        with torch.cuda.amp.autocast(enabled=getattr(args, 'fp16', False)):
+            output = model(partial_scan, complete_coord, complete_batch,
+                           return_loss=True, condition_features=cond_feat)
+            loss = output['loss']
 
         total_loss += loss if isinstance(loss, float) else loss.item()
         pbar.set_postfix({'loss': loss if isinstance(loss, float) else loss.item()})
@@ -464,6 +483,9 @@ def main():
         start_epoch = checkpoint['epoch'] + 1
         best_val_loss = checkpoint.get('best_val_loss', float('inf'))
 
+    # Mixed precision scaler
+    scaler = torch.cuda.amp.GradScaler(enabled=getattr(args, 'fp16', False))
+
     # Training loop
     print("\nStarting training...")
     for epoch in range(start_epoch, args.num_epochs):
@@ -473,7 +495,7 @@ def main():
 
         # Train
         train_loss = train_epoch(
-            model, train_loader, optimizer, epoch, args, writer
+            model, train_loader, optimizer, epoch, args, writer, scaler
         )
         logger.info(f"Train loss: {train_loss:.6f}")
 
