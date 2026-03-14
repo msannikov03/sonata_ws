@@ -178,70 +178,63 @@ def generate_sequence_map(
         if len(poses) != len(scan_files):
             print(f"Warning {seq}: {len(poses)} poses vs {len(scan_files)} scans")
 
-        # Aggregate all scans in world frame
-        all_points = []
-        for i, (pose, scan_file) in enumerate(
-            tqdm(
-                list(zip(poses, scan_files)),
-                desc=f"Sequence {seq}",
-                leave=False,
-            )
-        ):
-            scan_path = os.path.join(velodyne_dir, scan_file)
-            points = np.fromfile(scan_path, dtype=np.float32).reshape(-1, 4)
-
-            # Load labels to remove moving objects
-            label_path = os.path.join(labels_dir, scan_file.replace(".bin", ".label"))
-            if os.path.exists(label_path):
-                labels = np.fromfile(label_path, dtype=np.uint32) & 0xFFFF
-                static_mask = (labels < 252) | (labels > 259)
-                if static_mask.sum() < len(labels):
-                    points = points[static_mask]
-
-            # Remove flying artifacts (close to origin)
-            dist = np.linalg.norm(points[:, :3], axis=1)
-            points = points[dist > 3.5]
-
-            # Transform to world frame
-            ones = np.ones((points.shape[0], 1))
-            points_homo = np.hstack([points[:, :3], ones])  # (N, 4)
-            points_world = (pose @ points_homo.T).T[:, :3]
-            all_points.append(points_world)
-
-        if len(all_points) == 0:
-            print(f"Skipping {seq}: no points")
-            continue
-
-        map_points = np.vstack(all_points)
-
-        # Voxelize (numpy | open3d | torch)
-        map_voxel = voxelize(map_points, voxel_size, backend=backend)
-
-        # Output: one map per sequence, and per-scan copies in scan frame
+        # Sliding window GT generation: use +-WINDOW scans instead of full
+        # sequence to avoid OOM with dense Depth Pro point clouds
+        WINDOW = 25
+        MAX_GT_POINTS = 200000
         gt_seq_dir = os.path.join(output_dir, "ground_truth", seq)
         os.makedirs(gt_seq_dir, exist_ok=True)
 
-        # Save world-frame map once (for reference)
-        np.savez(
-            os.path.join(gt_seq_dir, "map_world.npz"),
-            points=map_voxel.astype(np.float32),
-        )
+        def load_scan_world(idx):
+            """Load a single scan, filter, subsample, transform to world frame."""
+            sf = scan_files[idx]
+            sp = os.path.join(velodyne_dir, sf)
+            pts = np.fromfile(sp, dtype=np.float32).reshape(-1, 4)
+            # Remove moving objects
+            lp = os.path.join(labels_dir, sf.replace(".bin", ".label"))
+            if os.path.exists(lp):
+                lb = np.fromfile(lp, dtype=np.uint32) & 0xFFFF
+                mask = (lb < 252) | (lb > 259)
+                if mask.sum() < len(lb):
+                    pts = pts[mask]
+            # Remove flying artifacts near origin
+            dist = np.linalg.norm(pts[:, :3], axis=1)
+            pts = pts[dist > 3.5]
+            # Subsample dense Depth Pro clouds to ~50k points
+            if len(pts) > 50000:
+                idx_sub = np.random.choice(len(pts), 50000, replace=False)
+                pts = pts[idx_sub]
+            ones = np.ones((pts.shape[0], 1))
+            homo = np.hstack([pts[:, :3], ones])
+            return (poses[idx] @ homo.T).T[:, :3]
 
-        # For each scan, save map in scan frame (aligns with partial input)
-        for i, (pose, scan_file) in enumerate(zip(poses, scan_files)):
-            if i >= len(poses):
-                break
+        # Pre-load and cache all scans in world frame
+        print(f"  Loading {len(scan_files)} scans...")
+        scan_cache = {}
+        for idx in tqdm(range(len(scan_files)), desc=f"Loading {seq}", leave=False):
+            scan_cache[idx] = load_scan_world(idx)
+
+        for i in tqdm(range(len(scan_files)), desc=f"Sequence {seq}"):
+            scan_id = scan_files[i].replace(".bin", "")
+            out_path = os.path.join(gt_seq_dir, f"{scan_id}.npz")
+            if os.path.exists(out_path):
+                continue
+            lo = max(0, i - WINDOW)
+            hi = min(len(scan_files), i + WINDOW + 1)
+            local_pts = [scan_cache[j] for j in range(lo, hi)]
+            all_pts = np.vstack(local_pts)
+            map_voxel = voxelize(all_pts, voxel_size, backend=backend)
+            del all_pts
             pose_inv = np.linalg.inv(poses[i])
             ones = np.ones((map_voxel.shape[0], 1))
-            map_homo = np.hstack([map_voxel, ones])
-            map_scan_frame = (pose_inv @ map_homo.T).T[:, :3]
+            map_scan = (pose_inv @ np.hstack([map_voxel, ones]).T).T[:, :3]
+            del map_voxel
+            if len(map_scan) > MAX_GT_POINTS:
+                idx_sub = np.random.choice(len(map_scan), MAX_GT_POINTS, replace=False)
+                map_scan = map_scan[idx_sub]
+            np.savez_compressed(out_path, points=map_scan.astype(np.float32))
 
-            scan_id = scan_file.replace(".bin", "")
-            np.savez(
-                os.path.join(gt_seq_dir, f"{scan_id}.npz"),
-                points=map_scan_frame.astype(np.float32),
-            )
-
+        del scan_cache
         print(f"Saved ground truth for sequence {seq} ({len(scan_files)} scans)")
 
 
