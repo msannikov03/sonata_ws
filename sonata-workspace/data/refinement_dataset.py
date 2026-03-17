@@ -26,8 +26,8 @@ class RefinementDataset(Dataset):
         split: str = "train",
         coarse_voxel_size: float = 0.1,
         fine_voxel_size: float = 0.05,
-        max_points_coarse: int = 10000,
-        max_points_fine: int = 30000,
+        max_points_coarse: int = 4000,
+        max_points_fine: int = 12000,
         use_ground_truth_maps: bool = True,
         sequences: List[str] = None,
     ):
