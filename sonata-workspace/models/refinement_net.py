@@ -117,7 +117,7 @@ def chamfer_distance(
     pred: torch.Tensor,
     target: torch.Tensor,
     reduce: str = "mean",
-    chunk_size: int = 5000,
+    chunk_size: int = 512,
 ) -> torch.Tensor:
     """
     Symmetric Chamfer distance between two point clouds.
