@@ -37,6 +37,63 @@ import numpy as np
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 
+
+
+class PairedSemanticKITTI(torch.utils.data.Dataset):
+    """
+    Paired dataset that returns both LiDAR and DA2 partial scans
+    for the SAME frame, ensuring teacher and student see the same scene.
+    """
+    def __init__(self, teacher_dataset, student_dataset):
+        assert len(teacher_dataset) == len(student_dataset), \
+            f"Dataset sizes must match: {len(teacher_dataset)} vs {len(student_dataset)}"
+        self.teacher_dataset = teacher_dataset
+        self.student_dataset = student_dataset
+
+    def __len__(self):
+        return len(self.teacher_dataset)
+
+    def __getitem__(self, idx):
+        teacher_sample = self.teacher_dataset[idx]
+        student_sample = self.student_dataset[idx]
+        # Prefix keys to distinguish
+        paired = {}
+        for k, v in teacher_sample.items():
+            paired[f'teacher_{k}'] = v
+        for k, v in student_sample.items():
+            paired[f'student_{k}'] = v
+        return paired
+
+
+def collate_paired(batch):
+    """Collate paired teacher+student samples."""
+    from data.semantickitti import collate_fn
+    # Separate teacher and student samples
+    teacher_batch_list = []
+    student_batch_list = []
+    for paired in batch:
+        t_sample = {k.replace('teacher_', ''): v for k, v in paired.items() if k.startswith('teacher_')}
+        s_sample = {k.replace('student_', ''): v for k, v in paired.items() if k.startswith('student_')}
+        teacher_batch_list.append(t_sample)
+        student_batch_list.append(s_sample)
+    teacher_batch = collate_fn(teacher_batch_list)
+    student_batch = collate_fn(student_batch_list)
+    return teacher_batch, student_batch
+
+
+def gpu_knn_interpolate(features, source_coords, target_coords, chunk_size=4096):
+    """Map features from source to target via nearest neighbor on GPU."""
+    all_indices = []
+    for start in range(0, target_coords.shape[0], chunk_size):
+        end = min(start + chunk_size, target_coords.shape[0])
+        dists = torch.cdist(
+            target_coords[start:end].unsqueeze(0).float(),
+            source_coords.unsqueeze(0).float()
+        ).squeeze(0)
+        all_indices.append(dists.argmin(dim=-1))
+    indices = torch.cat(all_indices, dim=0)
+    return features[indices]
+
 # ============================================================================
 # Distillation Losses
 # ============================================================================
@@ -279,12 +336,19 @@ class DistillationTrainer:
             )
 
         if self.strategy in ('structural', 'all'):
-            # For structural loss, compute denoised coordinates
-            # x_0 ≈ (noisy - sqrt(1-alpha)*pred_noise) / sqrt(alpha)
-            # We use the noise predictions as proxy for structural comparison
-            losses['structural_distill'] = self.alpha_structural * self.structural_loss_fn(
-                student_output, teacher_output, coords
-            )
+            # Compute denoised x_0 from noise predictions
+            # x_0 = (noisy - sqrt(1-alpha)*pred_noise) / sqrt(alpha)
+            # We need scheduler values and noisy_scan passed in
+            if hasattr(self, '_current_noisy') and hasattr(self, '_current_sa') and hasattr(self, '_current_som'):
+                student_x0 = (self._current_noisy - self._current_som * student_output) / (self._current_sa + 1e-8)
+                teacher_x0 = (self._current_noisy - self._current_som * teacher_output) / (self._current_sa + 1e-8)
+                losses['structural_distill'] = self.alpha_structural * self.structural_loss_fn(
+                    student_x0, teacher_x0, coords
+                )
+            else:
+                losses['structural_distill'] = self.alpha_structural * self.structural_loss_fn(
+                    student_output, teacher_output, coords
+                )
 
         return losses
 
@@ -294,25 +358,15 @@ class DistillationTrainer:
 # ============================================================================
 
 def train_epoch(trainer, student_model, teacher_model,
-                student_loader, teacher_loader,
+                paired_loader,
                 optimizer, scaler, epoch, args, writer):
-    """Train for one epoch with distillation."""
+    """Train for one epoch with distillation using paired dataloader."""
     student_model.train()
     total_losses = {}
 
-    student_iter = iter(student_loader)
-    teacher_iter = iter(teacher_loader)
+    pbar = tqdm(paired_loader, desc=f"Epoch {epoch}")
 
-    n_steps = min(len(student_loader), len(teacher_loader))
-    pbar = tqdm(range(n_steps), desc=f"Epoch {epoch}")
-
-    for step in pbar:
-        try:
-            student_batch = next(student_iter)
-            teacher_batch = next(teacher_iter)
-        except StopIteration:
-            break
-
+    for step, (teacher_batch, student_batch) in enumerate(pbar):
         # Move to GPU
         for key in student_batch:
             if isinstance(student_batch[key], torch.Tensor):
@@ -345,8 +399,8 @@ def train_epoch(trainer, student_model, teacher_model,
             with torch.no_grad():
                 # Get teacher condition features
                 teacher_cond, _ = teacher_model.condition_extractor(teacher_scan)
-                from models.diffusion_module import knn_interpolate
-                teacher_cond_mapped = knn_interpolate(
+                # Using gpu_knn_interpolate defined above instead of CPU scipy version
+                teacher_cond_mapped = gpu_knn_interpolate(
                     teacher_cond, teacher_scan['coord'], complete_coord
                 )
 
@@ -369,6 +423,11 @@ def train_epoch(trainer, student_model, teacher_model,
                 som = teacher_model.scheduler.sqrt_one_minus_alphas_cumprod.to(dev)[t_per_point].unsqueeze(-1)
                 noisy_scan = sa * complete_coord + som * noise
 
+                # Store for structural loss x_0 reconstruction
+                trainer._current_noisy = noisy_scan
+                trainer._current_sa = sa
+                trainer._current_som = som
+
                 # Teacher noise prediction with intermediates
                 teacher_pred, teacher_intermediates = forward_with_intermediates(
                     teacher_model.denoiser, noisy_scan, complete_coord, t,
@@ -378,7 +437,7 @@ def train_epoch(trainer, student_model, teacher_model,
             # ---- Student forward ----
             # Get student condition features
             student_cond, _ = student_model.condition_extractor(student_scan)
-            student_cond_mapped = knn_interpolate(
+            student_cond_mapped = gpu_knn_interpolate(
                 student_cond, student_scan['coord'], complete_coord
             )
 
@@ -417,11 +476,11 @@ def train_epoch(trainer, student_model, teacher_model,
         pbar.set_postfix({k: f"{v.item():.4f}" if isinstance(v, torch.Tensor) else f"{v:.4f}"
                           for k, v in losses.items()})
 
-        global_step = epoch * n_steps + step
+        global_step = epoch * len(paired_loader) + step
         for k, v in losses.items():
             writer.add_scalar(f'train/{k}', v.item() if isinstance(v, torch.Tensor) else v, global_step)
 
-    avg_losses = {k: v / n_steps for k, v in total_losses.items()}
+    avg_losses = {k: v / max(step + 1, 1) for k, v in total_losses.items()}
     return avg_losses
 
 
@@ -502,6 +561,8 @@ def parse_args():
     parser.add_argument('--save_freq', type=int, default=5)
     parser.add_argument('--eval_freq', type=int, default=1)
     parser.add_argument('--voxel_size', type=float, default=0.05)
+    parser.add_argument('--resume', type=str, default=None, help='Resume from student checkpoint')
+    parser.add_argument('--start_epoch', type=int, default=0, help='Starting epoch when resuming')
 
     return parser.parse_args()
 
@@ -532,6 +593,7 @@ def main():
     teacher_encoder = SonataEncoder(
         pretrained=args.encoder_ckpt,
         freeze=True,  # Always freeze teacher encoder
+        enable_flash=False,
         feature_levels=[0]
     )
     teacher_condition = ConditionalFeatureExtractor(
@@ -557,6 +619,7 @@ def main():
     student_encoder = SonataEncoder(
         pretrained=args.encoder_ckpt,
         freeze=args.freeze_encoder,
+        enable_flash=False,
         feature_levels=[0]
     )
     student_condition = ConditionalFeatureExtractor(
@@ -589,21 +652,17 @@ def main():
         voxel_size=args.voxel_size, use_ground_truth_maps=True, augmentation=False,
     )
 
-    student_loader = DataLoader(
-        student_train, batch_size=args.batch_size, shuffle=True,
-        num_workers=args.num_workers, collate_fn=collate_fn, pin_memory=True,
-    )
-    teacher_loader = DataLoader(
-        teacher_train, batch_size=args.batch_size, shuffle=True,
-        num_workers=args.num_workers, collate_fn=collate_fn, pin_memory=True,
+    paired_train = PairedSemanticKITTI(teacher_train, student_train)
+    paired_loader = DataLoader(
+        paired_train, batch_size=args.batch_size, shuffle=True,
+        num_workers=args.num_workers, collate_fn=collate_paired, pin_memory=True,
     )
     val_loader = DataLoader(
         val_dataset, batch_size=args.batch_size, shuffle=False,
         num_workers=args.num_workers, collate_fn=collate_fn, pin_memory=True,
     )
 
-    print(f"Student train: {len(student_train)} samples")
-    print(f"Teacher train: {len(teacher_train)} samples")
+    print(f"Paired train: {len(paired_train)} samples ({len(student_train)} per modality)")
     print(f"Validation: {len(val_dataset)} samples")
 
     # ---- Trainer ----
@@ -618,7 +677,7 @@ def main():
 
     # ---- Optimizer ----
     optimizer = optim.AdamW(
-        student_model.parameters(),
+        [p for p in student_model.parameters() if p.requires_grad],
         lr=args.learning_rate,
         weight_decay=args.weight_decay,
     )
@@ -629,16 +688,26 @@ def main():
 
     # ---- Training loop ----
     best_val_loss = float('inf')
+
+    # Resume from checkpoint
+    if args.resume and os.path.exists(args.resume):
+        ckpt = torch.load(args.resume, map_location="cuda", weights_only=False)
+        student_model.load_state_dict(ckpt["model_state_dict"])
+        if "optimizer_state_dict" in ckpt:
+            optimizer.load_state_dict(ckpt["optimizer_state_dict"])
+        if "best_val_loss" in ckpt:
+            best_val_loss = ckpt["best_val_loss"]
+        print(f"Resumed from {args.resume}, starting epoch {args.start_epoch}")
     print(f"\nStarting distillation training ({args.strategy})...\n")
 
-    for epoch in range(args.num_epochs):
+    for epoch in range(args.start_epoch, args.num_epochs):
         print(f"\n{'='*50}")
         print(f"Epoch {epoch}/{args.num_epochs}")
         print(f"{'='*50}")
 
         avg_losses = train_epoch(
             trainer, student_model, teacher_model,
-            student_loader, teacher_loader,
+            paired_loader,
             optimizer, scaler, epoch, args, writer,
         )
 
