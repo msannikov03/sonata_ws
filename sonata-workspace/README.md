@@ -195,3 +195,29 @@ You can now:
 
 This is the core experiment this workspace is structured to support.
 
+---
+
+## 6. Point-cloud VAE + latent diffusion (optional)
+
+Train a **PointNet-style VAE** on **complete** xyz (no voxel merging), then a **DDPM in latent space** conditioned on **Sonata** features from the **partial** scan. See `docs/LATENT_DIFFUSION.md` and `configs/latent_diffusion.yaml`.
+
+```bash
+cd sonata-workspace
+# 1) VAE
+python training/train_point_vae.py --data_path /path/to/SemanticKITTI/dataset
+
+# 2) Latent diffusion (requires VAE checkpoint)
+python training/train_diffusion_latent.py \
+  --vae_ckpt checkpoints/point_vae/best_point_vae.pth \
+  --data_path /path/to/SemanticKITTI/dataset \
+  --freeze_encoder
+
+# Inference → PLY (K decoded points)
+python inference_latent.py \
+  --input /path/to/00/velodyne/000000.bin \
+  --checkpoint checkpoints/latent_diffusion/best_latent_diffusion.pth \
+  --output completion.ply
+```
+
+Dataset flag: `SemanticKITTI(..., use_point_cloud=True)` subsamples raw points; complete-side labels are placeholders in this mode.
+
