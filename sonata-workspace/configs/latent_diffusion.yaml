@@ -1,0 +1,19 @@
+# Example overrides for training/train_diffusion_latent.py (pass --config)
+# Usage: python training/train_diffusion_latent.py --config configs/latent_diffusion.yaml --vae_ckpt checkpoints/point_vae/best_point_vae.pth
+
+data_path: ~/Simon_ws/dataset/SemanticKITTI/dataset
+batch_size: 4
+num_workers: 4
+num_epochs: 100
+learning_rate: 1.0e-4
+weight_decay: 0.01
+num_timesteps: 1000
+schedule: cosine
+denoising_steps: 50
+voxel_size_sonata: 0.05
+point_max_partial: 20000
+point_max_complete: 8000
+output_dir: checkpoints/latent_diffusion
+log_dir: logs/latent_diffusion
+freeze_encoder: true
+encoder_ckpt: facebook/sonata

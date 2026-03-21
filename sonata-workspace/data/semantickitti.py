@@ -79,6 +79,9 @@ class SemanticKITTI(Dataset):
         augmentation: bool = True,
         num_points_per_scan: Optional[int] = None,
         use_precomputed: bool = False,
+        use_point_cloud: bool = False,
+        point_max_partial: Optional[int] = None,
+        point_max_complete: Optional[int] = None,
     ):
         """
         Initialize SemanticKITTI dataset.
@@ -91,9 +94,17 @@ class SemanticKITTI(Dataset):
             use_ground_truth_maps: Use pre-generated complete maps as GT
             augmentation: Apply data augmentation
             num_points_per_scan: Subsample scans to this number
+            use_point_cloud: If True, skip voxelization; subsample raw XYZ only
+            point_max_partial: Max points for partial scan in point-cloud mode
+            point_max_complete: Max points for complete GT in point-cloud mode
         """
         super().__init__()
-        
+
+        if use_point_cloud and use_precomputed:
+            raise ValueError(
+                "use_point_cloud and use_precomputed cannot both be True."
+            )
+
         self.root = root
         self.split = split
         self.voxel_size = voxel_size
@@ -102,6 +113,9 @@ class SemanticKITTI(Dataset):
         self.augmentation = augmentation
         self.num_points_per_scan = num_points_per_scan
         self.use_precomputed = use_precomputed
+        self.use_point_cloud = use_point_cloud
+        self.point_max_partial = point_max_partial
+        self.point_max_complete = point_max_complete
         
         # Get sequences for this split
         self.sequences = self.SPLITS[split]
@@ -127,6 +141,8 @@ class SemanticKITTI(Dataset):
         print(f"Loaded SemanticKITTI {split} split:")
         print(f"  Sequences: {self.sequences}")
         print(f"  Total scans: {len(self.scan_files)}")
+        if self.use_point_cloud:
+            print("  Mode: point cloud (no voxelization)")
     
     def _build_file_lists(self):
         """Build lists of data files."""
@@ -241,31 +257,49 @@ class SemanticKITTI(Dataset):
         scan_center = scan.mean(axis=0)
         scan = scan - scan_center
         gt_complete = gt_complete - scan_center
-        
-        # Voxelize
-        scan_voxel, scan_labels = self._voxelize(scan, labels)
-        gt_labels_dummy = np.zeros(gt_complete.shape[0], dtype=np.int32)
-        gt_voxel, gt_labels = self._voxelize(gt_complete, gt_labels_dummy)
-        
-        # Limit number of points
-        if scan_voxel.shape[0] > self.max_points:
-            indices = np.random.choice(
-                scan_voxel.shape[0], 
-                self.max_points, 
-                replace=False
+
+        if self.use_point_cloud:
+            n_part = (
+                self.point_max_partial
+                if self.point_max_partial is not None
+                else self.max_points
             )
-            scan_voxel = scan_voxel[indices]
-            scan_labels = scan_labels[indices]
-        
-        if gt_voxel.shape[0] > self.max_points:
-            indices = np.random.choice(
-                gt_voxel.shape[0], 
-                self.max_points, 
-                replace=False
+            n_comp = (
+                self.point_max_complete
+                if self.point_max_complete is not None
+                else self.max_points
             )
-            gt_voxel = gt_voxel[indices]
-            gt_labels = gt_labels[indices]
-        
+            scan, scan_labels = self._subsample_scan(scan, labels, n_part)
+            gt_complete = self._subsample_points(gt_complete, n_comp)
+            # GT maps are xyz-only; semantics are not kept per point after subsampling
+            gt_labels = np.zeros(gt_complete.shape[0], dtype=np.int32)
+            scan_voxel = scan
+            gt_voxel = gt_complete
+        else:
+            # Voxelize
+            scan_voxel, scan_labels = self._voxelize(scan, labels)
+            gt_labels_dummy = np.zeros(gt_complete.shape[0], dtype=np.int32)
+            gt_voxel, gt_labels = self._voxelize(gt_complete, gt_labels_dummy)
+
+            # Limit number of points
+            if scan_voxel.shape[0] > self.max_points:
+                indices = np.random.choice(
+                    scan_voxel.shape[0],
+                    self.max_points,
+                    replace=False,
+                )
+                scan_voxel = scan_voxel[indices]
+                scan_labels = scan_labels[indices]
+
+            if gt_voxel.shape[0] > self.max_points:
+                indices = np.random.choice(
+                    gt_voxel.shape[0],
+                    self.max_points,
+                    replace=False,
+                )
+                gt_voxel = gt_voxel[indices]
+                gt_labels = gt_labels[indices]
+
         # Convert to tensors
         data = {
             'partial_coord': torch.from_numpy(scan_voxel).float(),
@@ -275,7 +309,7 @@ class SemanticKITTI(Dataset):
             'scan_center': torch.from_numpy(scan_center).float(),
             'idx': idx,
         }
-        
+
         # Add color if available (use height as color for now)
         partial_color = self._height_to_color(scan_voxel)
         complete_color = self._height_to_color(gt_voxel)
@@ -322,11 +356,20 @@ class SemanticKITTI(Dataset):
         """Randomly subsample scan."""
         if scan.shape[0] <= num_points:
             return scan, labels
-        
+
         indices = np.random.choice(
             scan.shape[0], num_points, replace=False
         )
         return scan[indices], labels[indices]
+
+    def _subsample_points(self, points: np.ndarray, num_points: int) -> np.ndarray:
+        """Randomly subsample xyz only (no labels)."""
+        if points.shape[0] <= num_points:
+            return points
+        indices = np.random.choice(
+            points.shape[0], num_points, replace=False
+        )
+        return points[indices]
     
     def _voxelize(
         self,
