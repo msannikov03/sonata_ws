@@ -124,6 +124,19 @@ class DiffusionScheduler:
             sqrt_one_minus_alphas_cumprod_t * noise
         )
     
+    def _to_device(self, device):
+        """Move scheduler tensors to device."""
+        self.betas = self.betas.to(device)
+        self.alphas = self.alphas.to(device)
+        self.alphas_cumprod = self.alphas_cumprod.to(device)
+        self.alphas_cumprod_prev = self.alphas_cumprod_prev.to(device)
+        self.sqrt_alphas_cumprod = self.sqrt_alphas_cumprod.to(device)
+        self.sqrt_one_minus_alphas_cumprod = self.sqrt_one_minus_alphas_cumprod.to(device)
+        self.sqrt_recip_alphas = self.sqrt_recip_alphas.to(device)
+        self.sqrt_recipm1_alphas = self.sqrt_recipm1_alphas.to(device)
+        self.posterior_variance = self.posterior_variance.to(device)
+        self.posterior_log_variance_clipped = self.posterior_log_variance_clipped.to(device)
+
     def p_sample_step(
         self,
         model: nn.Module,
@@ -131,57 +144,40 @@ class DiffusionScheduler:
         x_t_coords: torch.Tensor,
         t: int,
         condition: Dict[str, torch.Tensor],
-        clip_denoised: bool = True
+        clip_denoised: bool = False
     ) -> torch.Tensor:
         """
-        Single step of reverse diffusion: p(x_{t-1} | x_t)
-        
-        Args:
-            model: Denoising model
-            x_t_features: (N, 3) Noisy features at timestep t
-            x_t_coords: (N, 3) Point coordinates
-            t: Current timestep
-            condition: Conditional information
-            clip_denoised: Clip denoised output
-            
-        Returns:
-            (N, 3) Denoised features at timestep t-1
+        Single step of reverse diffusion: p(x_{t-1} | x_t).
+        Must be called with consecutive timesteps (t, t-1, ..., 0).
         """
-        batch_size = 1  # Assume single batch
-        t_tensor = torch.full((batch_size,), t, device=x_t_features.device)
-        
-        # Predict noise
+        device = x_t_features.device
+        self._to_device(device)
+
+        t_tensor = torch.full((1,), t, device=device)
         pred_noise = model(x_t_features, x_t_coords, t_tensor, condition)
-        
-        # Compute x_0 prediction
-        alpha_t = self.alphas_cumprod[t]
-        alpha_t_prev = self.alphas_cumprod_prev[t]
+
+        # Predict x_0
+        alpha_bar = self.alphas_cumprod[t]
+        alpha_bar_prev = self.alphas_cumprod_prev[t]
         beta_t = self.betas[t]
-        
-        # x_0 = (x_t - sqrt(1-alpha_t) * pred_noise) / sqrt(alpha_t)
+
         pred_x0 = (
             x_t_features - self.sqrt_one_minus_alphas_cumprod[t] * pred_noise
         ) / self.sqrt_alphas_cumprod[t]
-        
+
         if clip_denoised:
-            pred_x0 = torch.clamp(pred_x0, -1.0, 1.0)
-        
-        # Compute x_{t-1}
+            pred_x0 = torch.clamp(pred_x0, -50.0, 50.0)
+
         if t > 0:
-            noise = torch.randn_like(x_t_features)
-            posterior_variance_t = self.posterior_variance[t]
-            
-            # x_{t-1} = posterior_mean + sqrt(posterior_variance) * noise
+            posterior_var = beta_t * (1.0 - alpha_bar_prev) / (1.0 - alpha_bar)
             posterior_mean = (
-                self.sqrt_alphas_cumprod[t - 1] * pred_x0 +
-                torch.sqrt(1 - alpha_t_prev - posterior_variance_t) * pred_noise
+                torch.sqrt(alpha_bar_prev) * beta_t / (1.0 - alpha_bar) * pred_x0
+                + torch.sqrt(self.alphas[t]) * (1.0 - alpha_bar_prev) / (1.0 - alpha_bar) * x_t_features
             )
-            
-            x_t_prev = posterior_mean + torch.sqrt(posterior_variance_t) * noise
+            noise = torch.randn_like(x_t_features)
+            return posterior_mean + torch.sqrt(posterior_var) * noise
         else:
-            x_t_prev = pred_x0
-        
-        return x_t_prev
+            return pred_x0
 
 
 class SonataTransformerBlock(nn.Module):
@@ -796,45 +792,47 @@ class SceneCompletionDiffusion(nn.Module):
     def complete_scene(
         self,
         partial_scan: Dict[str, torch.Tensor],
-        num_steps: Optional[int] = None
+        num_steps: Optional[int] = None,
+        target_coords: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """
         Complete scene from partial scan (inference).
-        
+
         Args:
             partial_scan: Incomplete input scan
-            num_steps: Number of denoising steps (default: self.denoising_steps)
-            
+            num_steps: Number of denoising steps (default: all 1000)
+            target_coords: Dense coords to denoise at (matches training).
+                           If None, uses partial_scan coords.
+
         Returns:
             Completed scene point cloud (N, 3)
         """
         if num_steps is None:
-            num_steps = self.denoising_steps
-        
-        # Extract conditional features
+            num_steps = self.scheduler.num_timesteps  # use all steps
+
+        # Extract conditional features from partial scan
         cond_features, _ = self.condition_extractor(partial_scan)
-        
-        # Get coordinates from partial scan
-        coords = partial_scan['coord']
-        
+
+        # Determine coords for denoising
+        if target_coords is not None:
+            coords = target_coords
+            # Map condition features from partial coords to target coords
+            cond_features = knn_interpolate(
+                cond_features, partial_scan['coord'], coords
+            )
+        else:
+            coords = partial_scan['coord']
+
         # Start from pure noise
         x_t = torch.randn_like(coords)
-        
-        # Denoise step by step
-        timesteps = torch.linspace(
-            self.scheduler.num_timesteps - 1, 0, num_steps, 
-            dtype=torch.long, device=x_t.device
-        )
-        
-        for t in timesteps:
+
+        # Denoise using all consecutive timesteps (T-1, T-2, ..., 0)
+        for t in range(num_steps - 1, -1, -1):
             x_t = self.scheduler.p_sample_step(
-                self.denoiser,
-                x_t,
-                coords,
-                t.item(),
+                self.denoiser, x_t, coords, t,
                 {'features': cond_features}
             )
-        
+
         return x_t
 
 
