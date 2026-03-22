@@ -103,12 +103,18 @@ def parse_args():
 def build_partial_dict(batch, voxel_size_sonata: float) -> dict:
     coord = batch["partial_coord"]
     gc = torch.floor(coord / voxel_size_sonata).long()
+    # Shift per batch sample so grid_coord is non-negative
+    # (required by Sonata serialization / hashing)
+    batch_idx = batch["partial_batch"]
+    for b in batch_idx.unique():
+        mask = batch_idx == b
+        gc[mask] -= gc[mask].min(dim=0)[0]
     return {
         "coord": coord,
         "color": batch["partial_color"],
         "normal": batch["partial_normal"],
         "grid_coord": gc,
-        "batch": batch["partial_batch"],
+        "batch": batch_idx,
     }
 
 
