@@ -71,6 +71,7 @@ def prepare_partial(
         idx = np.random.choice(pts.shape[0], max_points, replace=False)
         pts = pts[idx]
     grid = np.floor(pts / voxel_size_sonata).astype(np.int64)
+    grid -= grid.min(axis=0)  # Shift to non-negative (Sonata serialization requirement)
     z = pts[:, 2]
     z_norm = (z - z.min()) / (z.max() - z.min() + 1e-6)
     colors = np.stack([z_norm, 1 - z_norm, 0.5 * np.ones_like(z_norm)], axis=1)
