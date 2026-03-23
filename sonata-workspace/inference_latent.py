@@ -31,6 +31,13 @@ def parse_args():
     p.add_argument("--output", type=str, default="latent_completion.ply")
     p.add_argument("--denoising_steps", type=int, default=50)
     p.add_argument(
+        "--sampling",
+        type=str,
+        default="ddim",
+        choices=["ddim", "ddpm"],
+        help="DDIM supports non-adjacent timesteps; DDPM uses t->t-1 steps.",
+    )
+    p.add_argument(
         "--voxel_size_sonata",
         type=float,
         default=0.05,
@@ -135,7 +142,11 @@ def main():
     model = build_model_from_checkpoint(args.checkpoint, args, device)
     model.eval()
 
-    pts = model.complete_scene(partial, num_steps=args.denoising_steps)
+    pts = model.complete_scene(
+        partial,
+        num_steps=args.denoising_steps,
+        sampling=args.sampling,
+    )
     if isinstance(pts, torch.Tensor):
         pts = pts.cpu().numpy()
     pts = pts + center

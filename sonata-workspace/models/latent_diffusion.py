@@ -209,6 +209,8 @@ class SceneCompletionLatentDiffusion(nn.Module):
         self,
         partial_scan: Dict[str, torch.Tensor],
         num_steps: Optional[int] = None,
+        sampling: str = "ddim",
+        eta: float = 0.0,
     ) -> torch.Tensor:
         """
         Returns decoded point cloud (K, 3) for batch_size 1, else (B, K, 3).
@@ -230,8 +232,61 @@ class SceneCompletionLatentDiffusion(nn.Module):
             dtype=torch.long,
             device=device,
         )
-        for t_int in timesteps:
-            z = self.p_sample_step(z, int(t_int.item()), cond)
+        # If integer linspace skips values, `p_sample_step()` (t -> t-1) is no longer correct.
+        # Use DDIM update when steps are not adjacent.
+        ts_list = timesteps.tolist()
+        ts_unique = sorted(set(ts_list), reverse=True)
+        if 0 not in ts_unique:
+            ts_unique.append(0)
+
+        sampling = sampling.lower()
+        use_ddpm = sampling == "ddpm" and all(
+            ts_unique[i] - 1 == ts_unique[i + 1]
+            for i in range(len(ts_unique) - 1)
+        )
+
+        if use_ddpm:
+            for t_int in ts_unique:
+                z = self.p_sample_step(z, int(t_int), cond)
+        else:
+            # DDIM-style latent sampling (epsilon-prediction parameterization).
+            # eta=0 gives deterministic sampling; higher eta adds stochasticity.
+            for i in range(len(ts_unique) - 1):
+                t = ts_unique[i]
+                t_prev = ts_unique[i + 1]
+
+                t_tensor = torch.full(
+                    (B,), t, device=device, dtype=torch.long
+                )
+                eps = self.denoiser(z, t_tensor, cond)
+
+                a_bar_t = self.scheduler.alphas_cumprod[t]
+                a_bar_prev = self.scheduler.alphas_cumprod[t_prev]
+
+                # x0 prediction from epsilon
+                sqrt_a_bar_t = torch.sqrt(a_bar_t)
+                sqrt_one_minus_a_bar_t = torch.sqrt(1.0 - a_bar_t)
+                x0_pred = (z - sqrt_one_minus_a_bar_t * eps) / sqrt_a_bar_t
+
+                # DDIM update
+                sqrt_a_bar_prev = torch.sqrt(a_bar_prev)
+                if eta == 0.0:
+                    z = (
+                        sqrt_a_bar_prev * x0_pred
+                        + torch.sqrt(1.0 - a_bar_prev) * eps
+                    )
+                else:
+                    sigma_t = (
+                        eta
+                        * torch.sqrt((1.0 - a_bar_prev) / (1.0 - a_bar_t))
+                        * torch.sqrt(1.0 - a_bar_t / a_bar_prev)
+                    )
+                    noise = torch.randn_like(z)
+                    z = (
+                        sqrt_a_bar_prev * x0_pred
+                        + torch.sqrt(torch.clamp(1.0 - a_bar_prev - sigma_t**2, min=0.0)) * eps
+                        + sigma_t * noise
+                    )
 
         pts = self.vae.decode(z)
         if pts.dim() == 3 and pts.size(0) == 1:
