@@ -197,20 +197,30 @@ This is the core experiment this workspace is structured to support.
 
 ---
 
+
+NEW 22 March(For MISHA)
+
 ## 6. Point-cloud VAE + latent diffusion (optional)
 
 Train a **PointNet-style VAE** on **complete** xyz (no voxel merging), then a **DDPM in latent space** conditioned on **Sonata** features from the **partial** scan. See `docs/LATENT_DIFFUSION.md` and `configs/latent_diffusion.yaml`.
 
 ```bash
 cd sonata-workspace
-# 1) VAE
-python training/train_point_vae.py --data_path /path/to/SemanticKITTI/dataset
+# 1) Latent autoencoder (pick one)
+# (A) Gaussian VAE
+python training/train_point_vae.py --data_path /path/to/SemanticKITTI/dataset --output_dir checkpoints/point_vae
 
-# 2) Latent diffusion (requires VAE checkpoint)
+# (B) VQ-VAE
+python training/train_point_vq_vae.py --data_path /path/to/SemanticKITTI/dataset --output_dir checkpoints/point_vq_vae
+
+# 2) Latent diffusion (requires autoencoder checkpoint)
 python training/train_diffusion_latent.py \
   --vae_ckpt checkpoints/point_vae/best_point_vae.pth \
   --data_path /path/to/SemanticKITTI/dataset \
   --freeze_encoder
+
+# If using VQ-VAE, swap --vae_ckpt:
+#   --vae_ckpt checkpoints/point_vq_vae/best_point_vq_vae.pth
 
 # Inference → PLY (K decoded points)
 python inference_latent.py \
