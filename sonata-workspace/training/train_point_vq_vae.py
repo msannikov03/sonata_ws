@@ -78,7 +78,7 @@ def train_epoch(model, loader, opt, epoch, args, writer, device):
         for b in range(bsz):
             m = cb == b
             pts = cc[m]  # (n_points, 3)
-            recon, z_e, z_q_st = model(pts)
+            recon, z_e, z_q_st, z_q = model(pts)
 
             total, recon_term, codebook_term, commit_term = (
                 vq_vae_reconstruction_chamfer(
@@ -88,6 +88,7 @@ def train_epoch(model, loader, opt, epoch, args, writer, device):
                     z_q_st,
                     beta_commit=args.beta_commit,
                     beta_codebook=args.beta_codebook,
+                    z_q=z_q,
                 )
             )
             (total / bsz).backward()
@@ -124,7 +125,7 @@ def validate(model, loader, args, device):
         for b in range(bsz):
             m = cb == b
             pts = cc[m]
-            recon, z_e, z_q_st = model(pts)
+            recon, z_e, z_q_st, z_q = model(pts)
             total, _, _, _ = vq_vae_reconstruction_chamfer(
                 recon,
                 pts,

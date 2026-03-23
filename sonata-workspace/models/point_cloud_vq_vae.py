@@ -86,26 +86,33 @@ class PointCloudVQVAE(nn.Module):
     @torch.no_grad()
     def quantize(self, z_e: torch.Tensor) -> torch.Tensor:
         """
-        Quantize latent vectors to nearest codebook entries.
-
-        Args:
-            z_e: (B, D) or (D,)
-        Returns:
-            z_q: same leading batch dims, each is codebook embedding.
+        Quantize latent vectors to nearest codebook entries (no grad).
+        Used at inference time.
         """
         single = z_e.dim() == 1
         if single:
-            z_e = z_e.unsqueeze(0)  # (1, D)
+            z_e = z_e.unsqueeze(0)
+        code = self.codebook.weight
+        dists = (z_e.unsqueeze(1) - code.unsqueeze(0)).pow(2).sum(dim=-1)
+        indices = dists.argmin(dim=-1)
+        z_q = self.codebook(indices)
+        if single:
+            z_q = z_q.squeeze(0)
+        return z_q
 
-        # Compute squared distances to each code.
-        # z_e: (B, D), codebook: (num_codes, D)
-        code = self.codebook.weight  # (C, D)
-        dists = (
-            (z_e.unsqueeze(1) - code.unsqueeze(0)).pow(2).sum(dim=-1)
-        )  # (B, C)
-        indices = dists.argmin(dim=-1)  # (B,)
-        z_q = self.codebook(indices)  # (B, D)
-
+    def quantize_with_grad(self, z_e: torch.Tensor) -> torch.Tensor:
+        """
+        Quantize with gradient flowing to codebook embeddings.
+        Finds nearest index without grad, then does lookup with grad.
+        """
+        single = z_e.dim() == 1
+        if single:
+            z_e = z_e.unsqueeze(0)
+        with torch.no_grad():
+            code = self.codebook.weight
+            dists = (z_e.unsqueeze(1) - code.unsqueeze(0)).pow(2).sum(dim=-1)
+            indices = dists.argmin(dim=-1)
+        z_q = self.codebook(indices)  # grad flows to codebook
         if single:
             z_q = z_q.squeeze(0)
         return z_q
@@ -113,7 +120,7 @@ class PointCloudVQVAE(nn.Module):
     def forward(
         self,
         points: torch.Tensor,
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Args:
             points: (N, 3)
@@ -121,15 +128,16 @@ class PointCloudVQVAE(nn.Module):
             recon: (K, 3)
             z_e: (D,) continuous embedding
             z_q_st: (D,) quantized embedding with straight-through gradients
+            z_q: (D,) quantized embedding with codebook gradients
         """
         z_e = self.encode_continuous(points)  # (D,)
-        z_q = self.quantize(z_e)  # (D,)
+        z_q = self.quantize_with_grad(z_e)  # (D,) grad to codebook
 
         # Straight-through estimator: forward uses z_q, backward uses z_e gradients.
         z_q_st = z_e + (z_q - z_e).detach()
 
         recon = self.decode(z_q_st)
-        return recon, z_e, z_q_st
+        return recon, z_e, z_q_st, z_q
 
     def encode_batched(
         self,
@@ -179,6 +187,7 @@ def vq_vae_reconstruction_chamfer(
     z_q_st: torch.Tensor,
     beta_commit: float = 0.25,
     beta_codebook: float = 1.0,
+    z_q: torch.Tensor = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Reconstruction + VQ losses.
@@ -188,18 +197,21 @@ def vq_vae_reconstruction_chamfer(
         target: (M, 3) target points
         z_e: (D,) encoder output embedding
         z_q_st: (D,) quantized latent (straight-through tensor)
+        z_q: (D,) quantized embedding with codebook gradients
     Returns:
         total, recon_term, codebook_term, commit_term
     """
     recon_term = chamfer_distance(recon, target)
 
-    # Codebook loss: move codebook toward encoder output.
-    # stop-grad on encoder.
-    z_q = z_q_st.detach()
+    # Use z_q with grad if provided, otherwise fall back (broken but backward compat)
+    if z_q is None:
+        z_q = z_q_st.detach()
+
+    # Codebook loss: move codebook toward encoder output (grad to codebook only)
     codebook_term = F.mse_loss(z_q, z_e.detach())
 
-    # Commitment loss: encourage encoder output to stay close to codebook.
-    commit_term = F.mse_loss(z_e, z_q)
+    # Commitment loss: encourage encoder to stay close to codebook (grad to encoder only)
+    commit_term = F.mse_loss(z_e, z_q.detach())
 
     total = recon_term + beta_codebook * codebook_term + beta_commit * commit_term
     return total, recon_term, codebook_term, commit_term
