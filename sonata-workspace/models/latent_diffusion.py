@@ -145,13 +145,22 @@ class SceneCompletionLatentDiffusion(nn.Module):
 
         ctx = torch.no_grad() if freeze_vae else torch.enable_grad()
         with ctx:
-            mu, logvar = self.vae.encode_batched(
+            enc_out = self.vae.encode_batched(
                 complete_coord, complete_batch, bsz
             )
-        if use_posterior_sample and not freeze_vae:
-            z0 = self.vae.reparameterize(mu, logvar)
+
+        # Gaussian VAE returns (mu, logvar). VQ-VAE returns z_q directly.
+        if isinstance(enc_out, tuple) and len(enc_out) == 2:
+            mu, logvar = enc_out
+            if use_posterior_sample and not freeze_vae and hasattr(
+                self.vae, "reparameterize"
+            ):
+                z0 = self.vae.reparameterize(mu, logvar)
+            else:
+                z0 = mu
         else:
-            z0 = mu
+            # VQ-VAE (or other latent models) return z0 directly.
+            z0 = enc_out
 
         t = torch.randint(
             0, self.scheduler.num_timesteps, (bsz,), device=device, dtype=torch.long
@@ -288,6 +297,10 @@ class SceneCompletionLatentDiffusion(nn.Module):
                         + sigma_t * noise
                     )
 
+        # If this is a VQ-VAE, map the final continuous latent back to the codebook
+        # before decoding (helps avoid drifting off-manifold).
+        if hasattr(self.vae, "quantize"):
+            z = self.vae.quantize(z)
         pts = self.vae.decode(z)
         if pts.dim() == 3 and pts.size(0) == 1:
             pts = pts.squeeze(0)

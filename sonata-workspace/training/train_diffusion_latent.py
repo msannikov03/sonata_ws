@@ -20,6 +20,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from data.semantickitti import SemanticKITTI, collate_fn
 from models.latent_diffusion import SceneCompletionLatentDiffusion
 from models.point_cloud_vae import PointCloudVAE
+from models.point_cloud_vq_vae import PointCloudVQVAE
 from models.sonata_encoder import ConditionalFeatureExtractor, SonataEncoder
 from utils.checkpoint import load_checkpoint, save_checkpoint
 from utils.logger import setup_logger
@@ -118,19 +119,53 @@ def build_partial_dict(batch, voxel_size_sonata: float) -> dict:
     }
 
 
-def _infer_vae_dims_from_state_dict(sd: dict) -> tuple[int, int]:
-    w = sd["vae.fc_mu.weight"]
-    latent_dim = w.shape[0]
-    k = sd["vae.decoder_out.weight"].shape[0] // 3
-    return latent_dim, k
+def _infer_vae_from_state_dict(sd: dict) -> tuple[str, int, int]:
+    """
+    Returns:
+        (vae_kind, latent_dim, num_decoded_points)
+    """
+    decoder_w = sd["vae.decoder_out.weight"]
+    k = decoder_w.shape[0] // 3
+
+    if "vae.fc_mu.weight" in sd:
+        latent_dim = sd["vae.fc_mu.weight"].shape[0]
+        return "gaussian_vae", latent_dim, k
+    if "vae.codebook.weight" in sd:
+        latent_dim = sd["vae.codebook.weight"].shape[1]
+        return "vq_vae", latent_dim, k
+
+    raise KeyError(
+        "Could not infer VAE type from checkpoint. Expected keys like "
+        "'vae.fc_mu.weight' or 'vae.codebook.weight'."
+    )
 
 
-def load_vae_from_checkpoint(path: str, device: torch.device) -> PointCloudVAE:
+def load_vae_from_checkpoint(path: str, device: torch.device):
     ck = torch.load(os.path.expanduser(path), map_location="cpu")
-    latent_dim = ck.get("latent_dim", 256)
-    k = ck.get("num_decoded_points", 2048)
-    vae = PointCloudVAE(latent_dim=latent_dim, num_decoded_points=k)
-    vae.load_state_dict(ck["model_state_dict"])
+    sd = ck["model_state_dict"]
+
+    # Point VAE checkpoints do not have the "vae." prefix.
+    decoder_w = sd["decoder_out.weight"]
+    k = decoder_w.shape[0] // 3
+
+    if "fc_mu.weight" in sd:
+        latent_dim = sd["fc_mu.weight"].shape[0]
+        vae = PointCloudVAE(latent_dim=latent_dim, num_decoded_points=k)
+    elif "codebook.weight" in sd:
+        latent_dim = sd["codebook.weight"].shape[1]
+        num_codes = sd["codebook.weight"].shape[0]
+        vae = PointCloudVQVAE(
+            latent_dim=latent_dim,
+            num_codes=num_codes,
+            num_decoded_points=k,
+        )
+    else:
+        raise KeyError(
+            "Could not infer VAE type from point VAE checkpoint. Expected "
+            "'fc_mu.weight' (Gaussian) or 'codebook.weight' (VQ-VAE)."
+        )
+
+    vae.load_state_dict(sd)
     return vae.to(device)
 
 
@@ -235,10 +270,20 @@ def main():
     if args.resume:
         ck0 = torch.load(os.path.expanduser(args.resume), map_location="cpu")
         sd0 = ck0["model_state_dict"]
-        ld, nk = _infer_vae_dims_from_state_dict(sd0)
+        vae_kind, ld, nk = _infer_vae_from_state_dict(sd0)
         num_t = ck0.get("num_timesteps", args.num_timesteps)
         sched = ck0.get("schedule", args.schedule)
-        vae = PointCloudVAE(latent_dim=ld, num_decoded_points=nk).to(device)
+        if vae_kind == "gaussian_vae":
+            vae = PointCloudVAE(latent_dim=ld, num_decoded_points=nk).to(device)
+        elif vae_kind == "vq_vae":
+            num_codes = sd0["vae.codebook.weight"].shape[0]
+            vae = PointCloudVQVAE(
+                latent_dim=ld,
+                num_codes=num_codes,
+                num_decoded_points=nk,
+            ).to(device)
+        else:
+            raise ValueError(f"Unknown vae_kind: {vae_kind}")
         model = SceneCompletionLatentDiffusion(
             vae=vae,
             condition_extractor=cond_ext,

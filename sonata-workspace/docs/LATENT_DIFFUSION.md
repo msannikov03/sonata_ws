@@ -15,10 +15,17 @@ cd sonata-workspace
 conda activate sonata_lidiff   # or your env
 
 # 1) VAE on complete clouds
+# (A) Gaussian VAE:
 python training/train_point_vae.py \
   --data_path /path/to/SemanticKITTI/dataset \
   --output_dir checkpoints/point_vae \
   --log_dir logs/point_vae
+
+# (B) VQ-VAE:
+python training/train_point_vq_vae.py \
+  --data_path /path/to/SemanticKITTI/dataset \
+  --output_dir checkpoints/point_vq_vae \
+  --log_dir logs/point_vq_vae
 
 # 2) Latent diffusion (frozen VAE by default)
 python training/train_diffusion_latent.py \
@@ -27,6 +34,9 @@ python training/train_diffusion_latent.py \
   --freeze_encoder \
   --output_dir checkpoints/latent_diffusion \
   --log_dir logs/latent_diffusion
+
+# If using VQ-VAE, swap --vae_ckpt:
+#   --vae_ckpt checkpoints/point_vq_vae/best_point_vq_vae.pth
 ```
 
 Optional YAML (still pass `--vae_ckpt` on the CLI unless you embed it in a custom YAML):

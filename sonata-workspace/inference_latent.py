@@ -16,6 +16,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from models.latent_diffusion import SceneCompletionLatentDiffusion
 from models.point_cloud_vae import PointCloudVAE
+from models.point_cloud_vq_vae import PointCloudVQVAE
 from models.sonata_encoder import ConditionalFeatureExtractor, SonataEncoder
 
 
@@ -92,12 +93,28 @@ def prepare_partial(
     return data, center
 
 
-def infer_architecture_from_state_dict(sd: dict) -> tuple[int, int]:
-    w = sd["vae.fc_mu.weight"]
-    latent_dim = w.shape[0]
+def infer_architecture_from_state_dict(sd: dict) -> tuple[str, int, int, int]:
+    """
+    Returns:
+        (vae_kind, latent_dim, num_codes, K)
+    """
     dec_w = sd["vae.decoder_out.weight"]
     k = dec_w.shape[0] // 3
-    return latent_dim, k
+
+    if "vae.fc_mu.weight" in sd:
+        latent_dim = sd["vae.fc_mu.weight"].shape[0]
+        return "gaussian_vae", latent_dim, 0, k
+
+    if "vae.codebook.weight" in sd:
+        codebook_w = sd["vae.codebook.weight"]
+        latent_dim = codebook_w.shape[1]
+        num_codes = codebook_w.shape[0]
+        return "vq_vae", latent_dim, num_codes, k
+
+    raise KeyError(
+        "Could not infer VAE kind from latent diffusion checkpoint. "
+        "Expected 'vae.fc_mu.weight' or 'vae.codebook.weight'."
+    )
 
 
 def build_model_from_checkpoint(
@@ -105,11 +122,18 @@ def build_model_from_checkpoint(
 ) -> SceneCompletionLatentDiffusion:
     ck = torch.load(ckpt_path, map_location="cpu")
     sd = ck["model_state_dict"]
-    latent_dim, k = infer_architecture_from_state_dict(sd)
+    vae_kind, latent_dim, num_codes, k = infer_architecture_from_state_dict(sd)
     num_t = ck.get("num_timesteps", 1000)
     sched = ck.get("schedule", "cosine")
 
-    vae = PointCloudVAE(latent_dim=latent_dim, num_decoded_points=k)
+    if vae_kind == "gaussian_vae":
+        vae = PointCloudVAE(latent_dim=latent_dim, num_decoded_points=k)
+    elif vae_kind == "vq_vae":
+        vae = PointCloudVQVAE(
+            latent_dim=latent_dim, num_codes=num_codes, num_decoded_points=k
+        )
+    else:
+        raise ValueError(f"Unknown vae_kind: {vae_kind}")
     encoder = SonataEncoder(
         pretrained=args.encoder_ckpt,
         freeze=args.freeze_encoder,
