@@ -17,3 +17,11 @@ output_dir: checkpoints/latent_diffusion
 log_dir: logs/latent_diffusion
 freeze_encoder: true
 encoder_ckpt: facebook/sonata
+
+# --- denoiser architecture (new defaults) ---
+hidden_dim: 1024
+num_denoiser_blocks: 8
+num_latent_tokens: 8
+num_cond_tokens: 32
+num_heads: 4
+time_embed_dim: 256

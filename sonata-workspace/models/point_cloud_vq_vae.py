@@ -52,12 +52,12 @@ class PointCloudVQVAE(nn.Module):
         self.point_encoder = nn.Sequential(*enc_layers)
         d_enc = encoder_widths[-1]
 
-        # Encoder output (continuous embedding) for quantization.
         self.encoder_out = nn.Linear(d_enc, latent_dim)
 
-        # Codebook embeddings: (num_codes, latent_dim)
+        # Codebook embeddings: (num_codes, latent_dim).
+        # Default nn.Embedding init is N(0,1) which gives a reasonable spread;
+        # the old uniform(±1/num_codes) was far too small and caused collapse.
         self.codebook = nn.Embedding(num_codes, latent_dim)
-        nn.init.uniform_(self.codebook.weight, -1.0 / num_codes, 1.0 / num_codes)
 
         dec_layers: List[nn.Module] = []
         d = latent_dim
@@ -83,28 +83,32 @@ class PointCloudVQVAE(nn.Module):
         pooled = feat.max(dim=0).values  # (d_enc,)
         return self.encoder_out(pooled)  # (D,)
 
-    @torch.no_grad()
     def quantize(self, z_e: torch.Tensor) -> torch.Tensor:
         """
         Quantize latent vectors to nearest codebook entries.
 
+        NOTE: no @torch.no_grad() — the codebook lookup (nn.Embedding forward)
+        must retain gradients so the codebook loss can update the entries.
+        The argmin index selection is naturally non-differentiable, which is fine.
+
         Args:
             z_e: (B, D) or (D,)
         Returns:
-            z_q: same leading batch dims, each is codebook embedding.
+            z_q: same shape, each row is a codebook embedding.
         """
         single = z_e.dim() == 1
         if single:
-            z_e = z_e.unsqueeze(0)  # (1, D)
+            z_e = z_e.unsqueeze(0)
 
-        # Compute squared distances to each code.
-        # z_e: (B, D), codebook: (num_codes, D)
         code = self.codebook.weight  # (C, D)
+        # Squared L2 distances — expanded form avoids materialising (B,C,D).
         dists = (
-            (z_e.unsqueeze(1) - code.unsqueeze(0)).pow(2).sum(dim=-1)
+            z_e.pow(2).sum(-1, keepdim=True)
+            - 2 * z_e @ code.t()
+            + code.pow(2).sum(-1, keepdim=True).t()
         )  # (B, C)
-        indices = dists.argmin(dim=-1)  # (B,)
-        z_q = self.codebook(indices)  # (B, D)
+        indices = dists.argmin(dim=-1)  # (B,) — not differentiable, that's OK
+        z_q = self.codebook(indices)  # (B, D) — differentiable w.r.t. codebook.weight
 
         if single:
             z_q = z_q.squeeze(0)
@@ -119,17 +123,18 @@ class PointCloudVQVAE(nn.Module):
             points: (N, 3)
         Returns:
             recon: (K, 3)
-            z_e: (D,) continuous embedding
-            z_q_st: (D,) quantized embedding with straight-through gradients
+            z_e: (D,) continuous embedding (has encoder gradients)
+            z_q: (D,) quantized embedding (has codebook gradients)
         """
         z_e = self.encode_continuous(points)  # (D,)
-        z_q = self.quantize(z_e)  # (D,)
+        z_q = self.quantize(z_e)  # (D,) — has codebook gradients
 
-        # Straight-through estimator: forward uses z_q, backward uses z_e gradients.
+        # Straight-through estimator: forward pass uses z_q values,
+        # backward pass routes gradients to z_e (the encoder).
         z_q_st = z_e + (z_q - z_e).detach()
 
         recon = self.decode(z_q_st)
-        return recon, z_e, z_q_st
+        return recon, z_e, z_q
 
     def encode_batched(
         self,
@@ -176,7 +181,7 @@ def vq_vae_reconstruction_chamfer(
     recon: torch.Tensor,
     target: torch.Tensor,
     z_e: torch.Tensor,
-    z_q_st: torch.Tensor,
+    z_q: torch.Tensor,
     beta_commit: float = 0.25,
     beta_codebook: float = 1.0,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -186,21 +191,20 @@ def vq_vae_reconstruction_chamfer(
     Args:
         recon: (K, 3) reconstructed points
         target: (M, 3) target points
-        z_e: (D,) encoder output embedding
-        z_q_st: (D,) quantized latent (straight-through tensor)
+        z_e: (D,) encoder output embedding (has encoder gradients)
+        z_q: (D,) quantized embedding (has codebook gradients via nn.Embedding)
     Returns:
         total, recon_term, codebook_term, commit_term
     """
     recon_term = chamfer_distance(recon, target)
 
-    # Codebook loss: move codebook toward encoder output.
-    # stop-grad on encoder.
-    z_q = z_q_st.detach()
+    # Codebook loss: move codebook entries toward encoder outputs.
+    # z_q carries gradients to self.codebook.weight; stop-grad on z_e.
     codebook_term = F.mse_loss(z_q, z_e.detach())
 
     # Commitment loss: encourage encoder output to stay close to codebook.
-    commit_term = F.mse_loss(z_e, z_q)
+    # Stop-grad on z_q so gradient flows only to encoder.
+    commit_term = F.mse_loss(z_e, z_q.detach())
 
     total = recon_term + beta_codebook * codebook_term + beta_commit * commit_term
     return total, recon_term, codebook_term, commit_term
-

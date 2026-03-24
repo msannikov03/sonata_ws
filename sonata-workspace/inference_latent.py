@@ -48,7 +48,7 @@ def parse_args():
         "--max_input_points",
         type=int,
         default=20000,
-        help="Random subsample partial scan to this cap (point mode, no voxel merge)",
+        help="Random subsample partial scan to this cap",
     )
     p.add_argument("--encoder_ckpt", type=str, default="facebook/sonata")
     p.add_argument("--freeze_encoder", action="store_true")
@@ -72,14 +72,14 @@ def prepare_partial(
     voxel_size_sonata: float,
     max_points: int,
     device: torch.device,
-) -> tuple[dict, np.ndarray]:
+) -> tuple:
     center = scan.mean(axis=0)
     pts = scan - center
     if pts.shape[0] > max_points:
         idx = np.random.choice(pts.shape[0], max_points, replace=False)
         pts = pts[idx]
     grid = np.floor(pts / voxel_size_sonata).astype(np.int64)
-    grid -= grid.min(axis=0)  # Shift to non-negative (Sonata serialization requirement)
+    grid -= grid.min(axis=0)
     z = pts[:, 2]
     z_norm = (z - z.min()) / (z.max() - z.min() + 1e-6)
     colors = np.stack([z_norm, 1 - z_norm, 0.5 * np.ones_like(z_norm)], axis=1)
@@ -93,47 +93,48 @@ def prepare_partial(
     return data, center
 
 
-def infer_architecture_from_state_dict(sd: dict) -> tuple[str, int, int, int]:
-    """
-    Returns:
-        (vae_kind, latent_dim, num_codes, K)
-    """
+# ---------------------------------------------------------------------------
+# Model construction from checkpoint
+# ---------------------------------------------------------------------------
+
+
+def _infer_vae(sd: dict) -> tuple:
+    """Returns (vae_kind, latent_dim, num_codes, K) from full-model state dict."""
     dec_w = sd["vae.decoder_out.weight"]
     k = dec_w.shape[0] // 3
-
     if "vae.fc_mu.weight" in sd:
-        latent_dim = sd["vae.fc_mu.weight"].shape[0]
-        return "gaussian_vae", latent_dim, 0, k
-
+        return "gaussian_vae", sd["vae.fc_mu.weight"].shape[0], 0, k
     if "vae.codebook.weight" in sd:
-        codebook_w = sd["vae.codebook.weight"]
-        latent_dim = codebook_w.shape[1]
-        num_codes = codebook_w.shape[0]
-        return "vq_vae", latent_dim, num_codes, k
-
-    raise KeyError(
-        "Could not infer VAE kind from latent diffusion checkpoint. "
-        "Expected 'vae.fc_mu.weight' or 'vae.codebook.weight'."
-    )
+        cb = sd["vae.codebook.weight"]
+        return "vq_vae", cb.shape[1], cb.shape[0], k
+    raise KeyError("Could not infer VAE kind from checkpoint.")
 
 
 def build_model_from_checkpoint(
-    ckpt_path: str, args, device: torch.device
+    ckpt_path: str, args, device: torch.device,
 ) -> SceneCompletionLatentDiffusion:
     ck = torch.load(ckpt_path, map_location="cpu")
     sd = ck["model_state_dict"]
-    vae_kind, latent_dim, num_codes, k = infer_architecture_from_state_dict(sd)
+
+    vae_kind, latent_dim, num_codes, k = _infer_vae(sd)
     num_t = ck.get("num_timesteps", 1000)
     sched = ck.get("schedule", "cosine")
+    hd = ck.get("hidden_dim", 1024)
+    ndb = ck.get("num_denoiser_blocks", 8)
+    nlt = ck.get("num_latent_tokens", 8)
+    nct = ck.get("num_cond_tokens", 32)
+    nh = ck.get("num_heads", 4)
+    ted = ck.get("time_embed_dim", 256)
 
     if vae_kind == "gaussian_vae":
         vae = PointCloudVAE(latent_dim=latent_dim, num_decoded_points=k)
     elif vae_kind == "vq_vae":
         vae = PointCloudVQVAE(
-            latent_dim=latent_dim, num_codes=num_codes, num_decoded_points=k
+            latent_dim=latent_dim, num_codes=num_codes, num_decoded_points=k,
         )
     else:
         raise ValueError(f"Unknown vae_kind: {vae_kind}")
+
     encoder = SonataEncoder(
         pretrained=args.encoder_ckpt,
         freeze=args.freeze_encoder,
@@ -141,14 +142,21 @@ def build_model_from_checkpoint(
         feature_levels=[0],
     )
     cond = ConditionalFeatureExtractor(
-        encoder, feature_levels=[0], fusion_type="concat"
+        encoder, feature_levels=[0], fusion_type="concat",
     )
+
     model = SceneCompletionLatentDiffusion(
         vae=vae,
         condition_extractor=cond,
         num_timesteps=num_t,
         schedule=sched,
         denoising_steps=args.denoising_steps,
+        hidden_dim=hd,
+        num_denoiser_blocks=ndb,
+        num_latent_tokens=nlt,
+        num_cond_tokens=nct,
+        num_heads=nh,
+        time_embed_dim=ted,
     )
     model.load_state_dict(sd)
     return model.to(device)
@@ -160,7 +168,7 @@ def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     scan = load_scan(args.input)
     partial, center = prepare_partial(
-        scan, args.voxel_size_sonata, args.max_input_points, device
+        scan, args.voxel_size_sonata, args.max_input_points, device,
     )
 
     model = build_model_from_checkpoint(args.checkpoint, args, device)
