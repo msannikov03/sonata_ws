@@ -198,11 +198,12 @@ This is the core experiment this workspace is structured to support.
 ---
 
 
-NEW 22 March(For MISHA)
+## 6. Point-cloud VAE + latent diffusion (v2)
 
-## 6. Point-cloud VAE + latent diffusion (optional)
-
-Train a **PointNet-style VAE** on **complete** xyz (no voxel merging), then a **DDPM in latent space** conditioned on **Sonata** features from the **partial** scan. See `docs/LATENT_DIFFUSION.md` and `configs/latent_diffusion.yaml`.
+Train a **PointNet-style VAE** (Gaussian or VQ-VAE) on **complete** xyz, then a
+**latent diffusion model** (DiT-style transformer denoiser) conditioned on
+**Perceiver-pooled Sonata features** from the partial scan.
+See `docs/LATENT_DIFFUSION.md` for full architecture details and `configs/latent_diffusion.yaml` for config.
 
 ```bash
 cd sonata-workspace
