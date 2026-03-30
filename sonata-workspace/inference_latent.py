@@ -99,11 +99,32 @@ def prepare_partial(
 
 
 def _infer_vae(sd: dict) -> tuple:
-    """Returns (vae_kind, latent_dim, num_codes, num_quantizers, K) from full-model state dict."""
+    """Returns (vae_kind, latent_dim, num_codes, num_quantizers, K, extra_kwargs)
+    from a full-model state dict."""
+
+    # Multi-token Gaussian VAE (v2)
+    if "vae.mu_proj.weight" in sd:
+        token_dim = sd["vae.mu_proj.weight"].shape[0]
+        internal_dim = sd["vae.mu_proj.weight"].shape[1]
+        nlt = sd["vae.enc_pooler.query"].shape[1]
+        k = sd["vae.point_queries"].shape[1]
+        ndb = sum(
+            1 for key in sd
+            if key.startswith("vae.dec_blocks.") and key.endswith(".cross_attn.in_proj_weight")
+        )
+        extra = {
+            "num_latent_tokens": nlt,
+            "internal_dim": internal_dim,
+            "num_dec_blocks": ndb,
+        }
+        return "gaussian_vae", nlt * token_dim, 0, 0, k, extra
+
+    # Legacy architectures with decoder_out
     dec_w = sd["vae.decoder_out.weight"]
     k = dec_w.shape[0] // 3
+
     if "vae.fc_mu.weight" in sd:
-        return "gaussian_vae", sd["vae.fc_mu.weight"].shape[0], 0, 0, k
+        return "gaussian_vae", sd["vae.fc_mu.weight"].shape[0], 0, 0, k, {}
 
     rvq_keys = [
         key for key in sd
@@ -111,12 +132,11 @@ def _infer_vae(sd: dict) -> tuple:
     ]
     if rvq_keys:
         cb0 = sd["vae.residual_vq.codebooks.0.weight"]
-        return "vq_vae", cb0.shape[1], cb0.shape[0], len(rvq_keys), k
+        return "vq_vae", cb0.shape[1], cb0.shape[0], len(rvq_keys), k, {}
 
-    # Legacy single-codebook
     if "vae.codebook.weight" in sd:
         cb = sd["vae.codebook.weight"]
-        return "vq_vae", cb.shape[1], cb.shape[0], 1, k
+        return "vq_vae", cb.shape[1], cb.shape[0], 1, k, {}
 
     raise KeyError("Could not infer VAE kind from checkpoint.")
 
@@ -127,7 +147,7 @@ def build_model_from_checkpoint(
     ck = torch.load(ckpt_path, map_location="cpu")
     sd = ck["model_state_dict"]
 
-    vae_kind, latent_dim, num_codes, num_q, k = _infer_vae(sd)
+    vae_kind, latent_dim, num_codes, num_q, k, vae_extra = _infer_vae(sd)
     num_t = ck.get("num_timesteps", 1000)
     sched = ck.get("schedule", "cosine")
     hd = ck.get("hidden_dim", 1024)
@@ -138,7 +158,9 @@ def build_model_from_checkpoint(
     ted = ck.get("time_embed_dim", 256)
 
     if vae_kind == "gaussian_vae":
-        vae = PointCloudVAE(latent_dim=latent_dim, num_decoded_points=k)
+        vae = PointCloudVAE(
+            latent_dim=latent_dim, num_decoded_points=k, **vae_extra,
+        )
     elif vae_kind == "vq_vae":
         vae = PointCloudVQVAE(
             latent_dim=latent_dim, num_codes=num_codes,
