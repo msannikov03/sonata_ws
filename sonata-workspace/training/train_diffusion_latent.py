@@ -130,15 +130,39 @@ def build_partial_dict(batch, voxel_size_sonata: float) -> dict:
 
 def _infer_vae_from_full_state_dict(sd: dict) -> tuple:
     """From a SceneCompletionLatentDiffusion state dict (keys prefixed 'vae.'),
-    infer VAE type, latent_dim, num_decoded_points, num_codes, num_quantizers."""
+    infer VAE type, latent_dim, K, num_codes, num_quantizers, and extra kwargs.
+
+    Returns:
+        (kind, latent_dim, K, num_codes, num_quantizers, extra_kwargs)
+    """
+    # --- Multi-token Gaussian VAE (v2) ---
+    if "vae.mu_proj.weight" in sd:
+        token_dim = sd["vae.mu_proj.weight"].shape[0]
+        internal_dim = sd["vae.mu_proj.weight"].shape[1]
+        nlt = sd["vae.enc_pooler.query"].shape[1]
+        latent_dim = nlt * token_dim
+        k = sd["vae.point_queries"].shape[1]
+        ndb = sum(
+            1 for key in sd
+            if key.startswith("vae.dec_blocks.") and key.endswith(".cross_attn.in_proj_weight")
+        )
+        extra = {
+            "num_latent_tokens": nlt,
+            "internal_dim": internal_dim,
+            "num_dec_blocks": ndb,
+        }
+        return "gaussian_vae", latent_dim, k, 0, 0, extra
+
+    # From here, legacy architectures that have vae.decoder_out.weight
     decoder_w = sd["vae.decoder_out.weight"]
     k = decoder_w.shape[0] // 3
 
+    # --- Legacy single-vector Gaussian VAE ---
     if "vae.fc_mu.weight" in sd:
         latent_dim = sd["vae.fc_mu.weight"].shape[0]
-        return "gaussian_vae", latent_dim, k, 0, 0
+        return "gaussian_vae", latent_dim, k, 0, 0, {}
 
-    # RVQ-based VQ-VAE: keys like vae.residual_vq.codebooks.{i}.weight
+    # --- RVQ-based VQ-VAE ---
     rvq_keys = [
         key for key in sd
         if key.startswith("vae.residual_vq.codebooks.") and key.endswith(".weight")
@@ -148,17 +172,17 @@ def _infer_vae_from_full_state_dict(sd: dict) -> tuple:
         latent_dim = cb0.shape[1]
         num_codes = cb0.shape[0]
         num_quantizers = len(rvq_keys)
-        return "vq_vae", latent_dim, k, num_codes, num_quantizers
+        return "vq_vae", latent_dim, k, num_codes, num_quantizers, {}
 
-    # Legacy single-codebook VQ-VAE
+    # --- Legacy single-codebook VQ-VAE ---
     if "vae.codebook.weight" in sd:
         latent_dim = sd["vae.codebook.weight"].shape[1]
         num_codes = sd["vae.codebook.weight"].shape[0]
-        return "vq_vae", latent_dim, k, num_codes, 1
+        return "vq_vae", latent_dim, k, num_codes, 1, {}
 
     raise KeyError(
         "Could not infer VAE type from checkpoint. Expected keys like "
-        "'vae.fc_mu.weight' or 'vae.residual_vq.codebooks.0.weight'."
+        "'vae.mu_proj.weight', 'vae.fc_mu.weight', or 'vae.residual_vq.codebooks.0.weight'."
     )
 
 
@@ -167,12 +191,36 @@ def load_vae_from_checkpoint(path: str, device: torch.device):
     ck = torch.load(os.path.expanduser(path), map_location="cpu")
     sd = ck["model_state_dict"]
 
+    # --- Multi-token Gaussian VAE (v2) ---
+    if "mu_proj.weight" in sd:
+        token_dim = sd["mu_proj.weight"].shape[0]
+        internal_dim = sd["mu_proj.weight"].shape[1]
+        nlt = sd["enc_pooler.query"].shape[1]
+        k = sd["point_queries"].shape[1]
+        ndb = sum(
+            1 for key in sd
+            if key.startswith("dec_blocks.") and key.endswith(".cross_attn.in_proj_weight")
+        )
+        vae = PointCloudVAE(
+            latent_dim=nlt * token_dim,
+            num_decoded_points=k,
+            num_latent_tokens=nlt,
+            internal_dim=internal_dim,
+            num_dec_blocks=ndb,
+        )
+        vae.load_state_dict(sd)
+        return vae.to(device)
+
+    # Legacy architectures use decoder_out
     decoder_w = sd["decoder_out.weight"]
     k = decoder_w.shape[0] // 3
 
     if "fc_mu.weight" in sd:
-        latent_dim = sd["fc_mu.weight"].shape[0]
-        vae = PointCloudVAE(latent_dim=latent_dim, num_decoded_points=k)
+        raise KeyError(
+            "Legacy single-vector Gaussian VAE checkpoint detected. "
+            "This architecture has been replaced by the multi-token version. "
+            "Please retrain with the new training/train_point_vae.py."
+        )
     elif "residual_vq.codebooks.0.weight" in sd:
         cb0 = sd["residual_vq.codebooks.0.weight"]
         latent_dim = cb0.shape[1]
@@ -190,7 +238,7 @@ def load_vae_from_checkpoint(path: str, device: torch.device):
     else:
         raise KeyError(
             "Could not infer VAE type from checkpoint. Expected "
-            "'fc_mu.weight' (Gaussian) or 'residual_vq.codebooks.0.weight' (RVQ VQ-VAE)."
+            "'mu_proj.weight' (Gaussian v2) or 'residual_vq.codebooks.0.weight' (RVQ VQ-VAE)."
         )
 
     vae.load_state_dict(sd)
@@ -357,7 +405,7 @@ def main():
     if args.resume:
         ck0 = torch.load(os.path.expanduser(args.resume), map_location="cpu")
         sd0 = ck0["model_state_dict"]
-        vae_kind, ld, nk, num_codes, num_q = _infer_vae_from_full_state_dict(sd0)
+        vae_kind, ld, nk, num_codes, num_q, vae_extra = _infer_vae_from_full_state_dict(sd0)
 
         # Restore architecture hyperparams from checkpoint (fall back to CLI).
         num_t = ck0.get("num_timesteps", args.num_timesteps)
@@ -370,7 +418,9 @@ def main():
         ted = ck0.get("time_embed_dim", args.time_embed_dim)
 
         if vae_kind == "gaussian_vae":
-            vae = PointCloudVAE(latent_dim=ld, num_decoded_points=nk).to(device)
+            vae = PointCloudVAE(
+                latent_dim=ld, num_decoded_points=nk, **vae_extra,
+            ).to(device)
         elif vae_kind == "vq_vae":
             vae = PointCloudVQVAE(
                 latent_dim=ld, num_codes=num_codes,

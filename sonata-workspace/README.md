@@ -198,37 +198,90 @@ This is the core experiment this workspace is structured to support.
 ---
 
 
-## 6. Point-cloud VAE + latent diffusion (v2)
+## 6. Point-cloud latent pipeline (Gaussian VAE + VQ-VAE, fixed)
 
-Train a **PointNet-style VAE** (Gaussian or VQ-VAE) on **complete** xyz, then a
-**latent diffusion model** (DiT-style transformer denoiser) conditioned on
-**Perceiver-pooled Sonata features** from the partial scan.
-See `docs/LATENT_DIFFUSION.md` for full architecture details and `configs/latent_diffusion.yaml` for config.
+This section describes the current **fixed** point-cloud latent pipelines used
+before latent diffusion training.
+
+### 6.1 Gaussian VAE pipeline (fixed)
+
+The Gaussian VAE is now a **multi-token latent VAE** (not the old single-vector
+maxpool + MLP decoder design):
+
+- Encoder: residual PointNet-style per-point MLP + cross-attention pooler.
+- Latent: `num_latent_tokens` Gaussian tokens flattened to `latent_dim`.
+- Decoder: learned point queries + cross-attention decoder blocks.
+
+This improves reconstruction quality and keeps the external interface unchanged
+for latent diffusion (`encode_batched` still returns `(mu, logvar)` with shape
+`(B, latent_dim)`).
+
+Recommended command:
 
 ```bash
 cd sonata-workspace
-# 1) Latent autoencoder (pick one)
-# (A) Gaussian VAE
-python training/train_point_vae.py --data_path /path/to/SemanticKITTI/dataset --output_dir checkpoints/point_vae
+python training/train_point_vae.py \
+  --data_path /path/to/SemanticKITTI/dataset \
+  --output_dir checkpoints/point_vae \
+  --latent_dim 1024 \
+  --num_latent_tokens 16 \
+  --num_decoded_points 4096 \
+  --num_dec_blocks 3 \
+  --beta_kl 1e-4
+```
 
-# (B) VQ-VAE
-python training/train_point_vq_vae.py --data_path /path/to/SemanticKITTI/dataset --output_dir checkpoints/point_vq_vae
+### 6.2 VQ-VAE pipeline (fixed)
 
-# 2) Latent diffusion (requires autoencoder checkpoint)
+The VQ-VAE now uses **Residual Vector Quantization (RVQ)** instead of a single
+codebook embedding per scene:
+
+- Quantizer: multi-level residual quantization (`num_quantizers`, default 8).
+- Effective capacity: `num_codes^num_quantizers` combinations.
+- Better resistance to codebook collapse than single-codebook setup.
+
+Recommended command:
+
+```bash
+python training/train_point_vq_vae.py \
+  --data_path /path/to/SemanticKITTI/dataset \
+  --output_dir checkpoints/point_vq_vae \
+  --latent_dim 256 \
+  --num_codes 1024 \
+  --num_quantizers 8 \
+  --num_decoded_points 2048
+```
+
+### 6.3 Latent diffusion on top of either autoencoder
+
+Train latent diffusion (DiT-style denoiser + latent normalizer + Perceiver
+condition pooler) after training one autoencoder:
+
+```bash
+# Gaussian VAE checkpoint example:
 python training/train_diffusion_latent.py \
   --vae_ckpt checkpoints/point_vae/best_point_vae.pth \
   --data_path /path/to/SemanticKITTI/dataset \
   --freeze_encoder
 
-# If using VQ-VAE, swap --vae_ckpt:
-#   --vae_ckpt checkpoints/point_vq_vae/best_point_vq_vae.pth
+# VQ-VAE checkpoint example:
+# python training/train_diffusion_latent.py \
+#   --vae_ckpt checkpoints/point_vq_vae/best_point_vq_vae.pth \
+#   --data_path /path/to/SemanticKITTI/dataset \
+#   --freeze_encoder
 
-# Inference → PLY (K decoded points)
+# Inference -> PLY (K decoded points)
 python inference_latent.py \
   --input /path/to/00/velodyne/000000.bin \
   --checkpoint checkpoints/latent_diffusion/best_latent_diffusion.pth \
   --output completion.ply
 ```
 
-Dataset flag: `SemanticKITTI(..., use_point_cloud=True)` subsamples raw points; complete-side labels are placeholders in this mode.
+Notes:
+
+- `SemanticKITTI(..., use_point_cloud=True)` is used in these pipelines. Raw
+  points are subsampled; complete-side semantic labels are placeholders in this mode.
+- Checkpoint loading in `train_diffusion_latent.py` and `inference_latent.py`
+  now auto-detects:
+  - Gaussian VAE v2 (`mu_proj`, `enc_pooler`, `point_queries` keys),
+  - RVQ VQ-VAE (`residual_vq.codebooks.*.weight` keys).
 
