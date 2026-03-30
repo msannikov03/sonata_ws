@@ -99,14 +99,25 @@ def prepare_partial(
 
 
 def _infer_vae(sd: dict) -> tuple:
-    """Returns (vae_kind, latent_dim, num_codes, K) from full-model state dict."""
+    """Returns (vae_kind, latent_dim, num_codes, num_quantizers, K) from full-model state dict."""
     dec_w = sd["vae.decoder_out.weight"]
     k = dec_w.shape[0] // 3
     if "vae.fc_mu.weight" in sd:
-        return "gaussian_vae", sd["vae.fc_mu.weight"].shape[0], 0, k
+        return "gaussian_vae", sd["vae.fc_mu.weight"].shape[0], 0, 0, k
+
+    rvq_keys = [
+        key for key in sd
+        if key.startswith("vae.residual_vq.codebooks.") and key.endswith(".weight")
+    ]
+    if rvq_keys:
+        cb0 = sd["vae.residual_vq.codebooks.0.weight"]
+        return "vq_vae", cb0.shape[1], cb0.shape[0], len(rvq_keys), k
+
+    # Legacy single-codebook
     if "vae.codebook.weight" in sd:
         cb = sd["vae.codebook.weight"]
-        return "vq_vae", cb.shape[1], cb.shape[0], k
+        return "vq_vae", cb.shape[1], cb.shape[0], 1, k
+
     raise KeyError("Could not infer VAE kind from checkpoint.")
 
 
@@ -116,7 +127,7 @@ def build_model_from_checkpoint(
     ck = torch.load(ckpt_path, map_location="cpu")
     sd = ck["model_state_dict"]
 
-    vae_kind, latent_dim, num_codes, k = _infer_vae(sd)
+    vae_kind, latent_dim, num_codes, num_q, k = _infer_vae(sd)
     num_t = ck.get("num_timesteps", 1000)
     sched = ck.get("schedule", "cosine")
     hd = ck.get("hidden_dim", 1024)
@@ -130,7 +141,8 @@ def build_model_from_checkpoint(
         vae = PointCloudVAE(latent_dim=latent_dim, num_decoded_points=k)
     elif vae_kind == "vq_vae":
         vae = PointCloudVQVAE(
-            latent_dim=latent_dim, num_codes=num_codes, num_decoded_points=k,
+            latent_dim=latent_dim, num_codes=num_codes,
+            num_quantizers=max(num_q, 1), num_decoded_points=k,
         )
     else:
         raise ValueError(f"Unknown vae_kind: {vae_kind}")

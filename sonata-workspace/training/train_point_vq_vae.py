@@ -1,5 +1,5 @@
 """
-Train PointCloudVQVAE on complete point clouds (point-cloud dataset mode).
+Train PointCloudVQVAE (with Residual VQ) on complete point clouds.
 """
 
 from __future__ import annotations
@@ -19,16 +19,14 @@ sys.path.insert(
 )
 
 from data.semantickitti import SemanticKITTI, collate_fn
-from models.point_cloud_vq_vae import (
-    PointCloudVQVAE,
-    vq_vae_reconstruction_chamfer,
-)
+from models.point_cloud_vq_vae import PointCloudVQVAE
+from models.refinement_net import chamfer_distance
 from utils.checkpoint import load_checkpoint, save_checkpoint
 from utils.logger import setup_logger
 
 
 def parse_args():
-    p = argparse.ArgumentParser(description="Train point cloud VQ-VAE")
+    p = argparse.ArgumentParser(description="Train point cloud VQ-VAE (RVQ)")
     p.add_argument(
         "--data_path",
         type=str,
@@ -43,10 +41,9 @@ def parse_args():
 
     p.add_argument("--latent_dim", type=int, default=256)
     p.add_argument("--num_codes", type=int, default=1024)
+    p.add_argument("--num_quantizers", type=int, default=8)
     p.add_argument("--num_decoded_points", type=int, default=2048)
-
     p.add_argument("--beta_commit", type=float, default=0.25)
-    p.add_argument("--beta_codebook", type=float, default=1.0)
 
     p.add_argument("--point_max_partial", type=int, default=20000)
     p.add_argument("--point_max_complete", type=int, default=8000)
@@ -77,19 +74,12 @@ def train_epoch(model, loader, opt, epoch, args, writer, device):
         loss_b = 0.0
         for b in range(bsz):
             m = cb == b
-            pts = cc[m]  # (n_points, 3)
-            recon, z_e, z_q_st = model(pts)
+            pts = cc[m]
+            recon, z_e, z_q, vq_loss = model(pts)
 
-            total, recon_term, codebook_term, commit_term = (
-                vq_vae_reconstruction_chamfer(
-                    recon,
-                    pts,
-                    z_e,
-                    z_q_st,
-                    beta_commit=args.beta_commit,
-                    beta_codebook=args.beta_codebook,
-                )
-            )
+            recon_loss = chamfer_distance(recon, pts)
+            total = recon_loss + vq_loss
+
             (total / bsz).backward()
             loss_b += total.item()
 
@@ -101,6 +91,13 @@ def train_epoch(model, loader, opt, epoch, args, writer, device):
         n += 1
         step = epoch * len(loader) + i
         writer.add_scalar("train/loss", loss_b / bsz, step)
+
+        if i % 200 == 0:
+            usage = model.residual_vq.compute_usage(
+                model.encode_continuous(cc[cb == 0]).unsqueeze(0)
+            )
+            for key, val in usage.items():
+                writer.add_scalar(f"codebook/{key}", val, step)
 
     return tot / max(n, 1)
 
@@ -124,15 +121,9 @@ def validate(model, loader, args, device):
         for b in range(bsz):
             m = cb == b
             pts = cc[m]
-            recon, z_e, z_q_st = model(pts)
-            total, _, _, _ = vq_vae_reconstruction_chamfer(
-                recon,
-                pts,
-                z_e,
-                z_q_st,
-                beta_commit=args.beta_commit,
-                beta_codebook=args.beta_codebook,
-            )
+            recon, z_e, z_q, vq_loss = model(pts)
+            recon_loss = chamfer_distance(recon, pts)
+            total = recon_loss + vq_loss
             loss_b += total.item() / bsz
 
         tot += loss_b
@@ -189,7 +180,9 @@ def main():
     model = PointCloudVQVAE(
         latent_dim=args.latent_dim,
         num_codes=args.num_codes,
+        num_quantizers=args.num_quantizers,
         num_decoded_points=args.num_decoded_points,
+        beta_commit=args.beta_commit,
     ).to(device)
 
     opt = optim.AdamW(
@@ -219,6 +212,7 @@ def main():
             "latent_dim": args.latent_dim,
             "num_decoded_points": args.num_decoded_points,
             "num_codes": args.num_codes,
+            "num_quantizers": args.num_quantizers,
         }
         if va < best:
             best = va
@@ -251,4 +245,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
