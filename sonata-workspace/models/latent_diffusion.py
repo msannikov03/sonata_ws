@@ -1,82 +1,314 @@
 """
-Latent diffusion on PointCloudVAE latent z, conditioned on pooled Sonata features.
+Latent diffusion for point-cloud scene completion.
+
+Key design decisions (fixes over the initial MLP-based implementation):
+
+1. **Latent normalisation** – VAE latents are scaled to ~unit variance before
+   the forward diffusion process.  The cosine / linear noise schedule assumes
+   unit-scale data; without this, the signal-to-noise ratio is wrong and
+   inference from pure noise fails (Rombach et al. 2022, §3.3).
+
+2. **Perceiver-style condition pooler** – replaces mean-pooling with learned
+   cross-attention queries, compressing variable-length per-point Sonata
+   features into a fixed set of condition tokens that retain spatial info.
+
+3. **Token-based transformer denoiser** – the latent vector is split into
+   tokens, processed through self-attention + cross-attention to condition
+   tokens + MLP blocks with AdaLN time conditioning, then recombined.
+   Much more expressive than the old 3-layer MLP (DiT-style architecture).
 """
 
 from __future__ import annotations
 
-from typing import Dict, Optional, Tuple
+import math
+from typing import Dict, List, Optional, Tuple
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
 from models.diffusion_module import DiffusionScheduler, SinusoidalTimeEmbedding
-from models.point_cloud_vae import PointCloudVAE
 from models.sonata_encoder import ConditionalFeatureExtractor
 
 
-class LatentMLPDenoiser(nn.Module):
-    """Predicts epsilon in latent space."""
+# ---------------------------------------------------------------------------
+# Latent normaliser
+# ---------------------------------------------------------------------------
+
+
+class LatentNormalizer(nn.Module):
+    """Running-EMA normalisation that brings VAE latents to ~unit variance.
+
+    The first batch initialises the statistics directly; subsequent batches
+    refine them via exponential moving average.  During inference the stored
+    running_mean / running_var are used to denormalize the sampled latent.
+    """
+
+    def __init__(self, dim: int, momentum: float = 0.01):
+        super().__init__()
+        self.dim = dim
+        self.momentum = momentum
+        self.register_buffer("running_mean", torch.zeros(dim))
+        self.register_buffer("running_var", torch.ones(dim))
+        self.register_buffer("num_batches", torch.tensor(0, dtype=torch.long))
+
+    @torch.no_grad()
+    def update(self, z: torch.Tensor) -> None:
+        """EMA update from a batch of latents z (B, D)."""
+        if z.size(0) < 2:
+            return
+        batch_mean = z.mean(dim=0)
+        batch_var = z.var(dim=0, unbiased=False).clamp(min=1e-8)
+        if self.num_batches == 0:
+            self.running_mean.copy_(batch_mean)
+            self.running_var.copy_(batch_var)
+        else:
+            m = self.momentum
+            self.running_mean.lerp_(batch_mean, m)
+            self.running_var.lerp_(batch_var, m)
+        self.num_batches += 1
+
+    def normalize(self, z: torch.Tensor) -> torch.Tensor:
+        return (z - self.running_mean) / (self.running_var.sqrt() + 1e-8)
+
+    def denormalize(self, z: torch.Tensor) -> torch.Tensor:
+        return z * (self.running_var.sqrt() + 1e-8) + self.running_mean
+
+
+# ---------------------------------------------------------------------------
+# Condition pooler (Perceiver-style)
+# ---------------------------------------------------------------------------
+
+
+class ConditionPooler(nn.Module):
+    """Compress variable-length per-point Sonata features into a fixed set of
+    condition tokens via learned cross-attention queries (Perceiver-style)."""
 
     def __init__(
         self,
-        latent_dim: int,
-        cond_dim: int,
-        time_embed_dim: int = 128,
-        hidden_dim: int = 512,
+        feat_dim: int,
+        num_tokens: int = 32,
+        num_heads: int = 4,
     ):
         super().__init__()
-        self.time_embedding = SinusoidalTimeEmbedding(time_embed_dim)
-        in_dim = latent_dim + time_embed_dim + cond_dim
-        self.net = nn.Sequential(
-            nn.Linear(in_dim, hidden_dim),
-            nn.LayerNorm(hidden_dim),
+        self.num_tokens = num_tokens
+        self.feat_dim = feat_dim
+        self.query = nn.Parameter(torch.randn(1, num_tokens, feat_dim) * 0.02)
+        self.norm_q = nn.LayerNorm(feat_dim)
+        self.attn = nn.MultiheadAttention(feat_dim, num_heads, batch_first=True)
+        self.norm_ff = nn.LayerNorm(feat_dim)
+        self.ff = nn.Sequential(
+            nn.Linear(feat_dim, feat_dim * 2),
             nn.GELU(),
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.LayerNorm(hidden_dim),
-            nn.GELU(),
-            nn.Linear(hidden_dim, latent_dim),
+            nn.Linear(feat_dim * 2, feat_dim),
         )
 
     def forward(
-        self, z_t: torch.Tensor, t: torch.Tensor, cond: torch.Tensor
+        self,
+        feat: torch.Tensor,
+        batch_idx: torch.Tensor,
+        batch_size: int,
+    ) -> torch.Tensor:
+        """(N_total, C) + batch indices → (B, num_tokens, C)."""
+        parts: List[torch.Tensor] = []
+        for b in range(batch_size):
+            mask = batch_idx == b
+            kv = feat[mask].unsqueeze(0)  # (1, Nb, C)
+            q = self.norm_q(self.query)  # (1, T, C)
+            h, _ = self.attn(q, kv, kv)  # (1, T, C)
+            h = h + self.query  # residual around attention
+            h = h + self.ff(self.norm_ff(h))  # FF residual
+            parts.append(h.squeeze(0))  # (T, C)
+        return torch.stack(parts)  # (B, T, C)
+
+
+# ---------------------------------------------------------------------------
+# Denoiser building blocks (DiT-style)
+# ---------------------------------------------------------------------------
+
+
+class AdaLN(nn.Module):
+    """Adaptive Layer Normalisation conditioned on a time embedding vector.
+    Initialised so that scale=1, shift=0 (i.e. identity)."""
+
+    def __init__(self, dim: int, cond_dim: int):
+        super().__init__()
+        self.norm = nn.LayerNorm(dim, elementwise_affine=False)
+        self.proj = nn.Sequential(nn.SiLU(), nn.Linear(cond_dim, dim * 2))
+        nn.init.zeros_(self.proj[-1].weight)
+        nn.init.zeros_(self.proj[-1].bias)
+
+    def forward(self, x: torch.Tensor, c: torch.Tensor) -> torch.Tensor:
+        """x: (B, L, D), c: (B, cond_dim). Returns (B, L, D)."""
+        s, b = self.proj(c).unsqueeze(1).chunk(2, dim=-1)
+        return self.norm(x) * (1 + s) + b
+
+
+class DenoiserBlock(nn.Module):
+    """Self-attn → cross-attn (to condition tokens) → MLP, each gated by AdaLN."""
+
+    def __init__(
+        self,
+        dim: int,
+        cond_kv_dim: int,
+        time_dim: int,
+        num_heads: int = 4,
+        mlp_ratio: float = 4.0,
+    ):
+        super().__init__()
+        self.adaln_sa = AdaLN(dim, time_dim)
+        self.self_attn = nn.MultiheadAttention(dim, num_heads, batch_first=True)
+
+        self.adaln_ca = AdaLN(dim, time_dim)
+        self.cross_attn = nn.MultiheadAttention(
+            dim,
+            num_heads,
+            batch_first=True,
+            kdim=cond_kv_dim,
+            vdim=cond_kv_dim,
+        )
+
+        self.adaln_ff = AdaLN(dim, time_dim)
+        hidden = int(dim * mlp_ratio)
+        self.ff = nn.Sequential(
+            nn.Linear(dim, hidden),
+            nn.GELU(),
+            nn.Linear(hidden, dim),
+        )
+        nn.init.zeros_(self.ff[-1].weight)
+        nn.init.zeros_(self.ff[-1].bias)
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        cond: torch.Tensor,
+        t_emb: torch.Tensor,
+    ) -> torch.Tensor:
+        """x: (B,L,D), cond: (B,K,C_cond), t_emb: (B,t_dim)."""
+        h = self.adaln_sa(x, t_emb)
+        h, _ = self.self_attn(h, h, h)
+        x = x + h
+
+        h = self.adaln_ca(x, t_emb)
+        h, _ = self.cross_attn(h, cond, cond)
+        x = x + h
+
+        x = x + self.ff(self.adaln_ff(x, t_emb))
+        return x
+
+
+# ---------------------------------------------------------------------------
+# Token-based latent denoiser
+# ---------------------------------------------------------------------------
+
+
+class LatentDenoiser(nn.Module):
+    """Splits z into tokens, processes with transformer blocks that
+    cross-attend to condition tokens, then recombines to predict epsilon."""
+
+    def __init__(
+        self,
+        latent_dim: int = 256,
+        cond_dim: int = 256,
+        hidden_dim: int = 1024,
+        time_embed_dim: int = 256,
+        num_blocks: int = 8,
+        num_heads: int = 4,
+        num_latent_tokens: int = 8,
+        mlp_ratio: float = 4.0,
+    ):
+        super().__init__()
+        self.latent_dim = latent_dim
+        self.hidden_dim = hidden_dim
+        self.num_latent_tokens = num_latent_tokens
+        assert hidden_dim % num_latent_tokens == 0
+        self.token_dim = hidden_dim // num_latent_tokens
+
+        self.time_embed = SinusoidalTimeEmbedding(time_embed_dim)
+        self.time_proj = nn.Sequential(
+            nn.Linear(time_embed_dim, time_embed_dim * 4),
+            nn.GELU(),
+            nn.Linear(time_embed_dim * 4, time_embed_dim),
+        )
+
+        self.input_proj = nn.Linear(latent_dim, hidden_dim)
+        self.pos_embed = nn.Parameter(
+            torch.randn(1, num_latent_tokens, self.token_dim) * 0.02,
+        )
+
+        self.blocks = nn.ModuleList(
+            [
+                DenoiserBlock(
+                    self.token_dim,
+                    cond_dim,
+                    time_embed_dim,
+                    num_heads=num_heads,
+                    mlp_ratio=mlp_ratio,
+                )
+                for _ in range(num_blocks)
+            ]
+        )
+
+        self.final_norm = nn.LayerNorm(self.token_dim)
+        self.output_proj = nn.Linear(hidden_dim, latent_dim)
+        nn.init.zeros_(self.output_proj.weight)
+        nn.init.zeros_(self.output_proj.bias)
+
+    def forward(
+        self,
+        z_t: torch.Tensor,
+        t: torch.Tensor,
+        cond: torch.Tensor,
     ) -> torch.Tensor:
         """
-        z_t: (B, latent_dim), t: (B,) long, cond: (B, cond_dim)
+        z_t:  (B, latent_dim) noisy latent
+        t:    (B,) integer timesteps
+        cond: (B, K, cond_dim) condition tokens from ConditionPooler
+        Returns: (B, latent_dim) predicted noise epsilon.
         """
-        t_emb = self.time_embedding(t.float())
-        x = torch.cat([z_t, t_emb, cond], dim=-1)
-        return self.net(x)
+        B = z_t.size(0)
+
+        t_emb = self.time_proj(self.time_embed(t.float()))  # (B, time_embed_dim)
+
+        h = self.input_proj(z_t)  # (B, hidden_dim)
+        tokens = h.view(B, self.num_latent_tokens, self.token_dim) + self.pos_embed
+
+        for block in self.blocks:
+            tokens = block(tokens, cond, t_emb)
+
+        tokens = self.final_norm(tokens)
+        h = tokens.reshape(B, self.hidden_dim)
+        return self.output_proj(h)
 
 
-def pool_per_point_to_batch(
-    feat: torch.Tensor, batch_idx: torch.Tensor, batch_size: int
-) -> torch.Tensor:
-    """Mean-pool (N, C) -> (B, C)."""
-    out = []
-    for b in range(batch_size):
-        m = batch_idx == b
-        if m.any():
-            out.append(feat[m].mean(dim=0))
-        else:
-            out.append(feat.new_zeros(feat.size(-1)))
-    return torch.stack(out, dim=0)
+# ---------------------------------------------------------------------------
+# Scene completion module
+# ---------------------------------------------------------------------------
 
 
 class SceneCompletionLatentDiffusion(nn.Module):
     """
-    Diffusion on VAE latent z_0 = encode(complete cloud).
-    Condition: mean-pooled Sonata conditional features from partial scan.
+    Full latent diffusion pipeline for scene completion.
+
+    Fixes:
+    - LatentNormalizer: z scaled to unit variance before diffusion.
+    - ConditionPooler: Perceiver cross-attention preserves spatial info.
+    - LatentDenoiser: token transformer (not a 3-layer MLP).
     """
 
     def __init__(
         self,
-        vae: PointCloudVAE,
+        vae: nn.Module,
         condition_extractor: ConditionalFeatureExtractor,
         num_timesteps: int = 1000,
         schedule: str = "cosine",
         denoising_steps: int = 50,
-        hidden_dim: int = 512,
+        hidden_dim: int = 1024,
+        num_denoiser_blocks: int = 8,
+        num_latent_tokens: int = 8,
+        num_cond_tokens: int = 32,
+        num_heads: int = 4,
+        time_embed_dim: int = 256,
     ):
         super().__init__()
         self.vae = vae
@@ -86,44 +318,56 @@ class SceneCompletionLatentDiffusion(nn.Module):
         self.denoising_steps = denoising_steps
 
         self.scheduler = DiffusionScheduler(
-            num_timesteps=num_timesteps, schedule=schedule
+            num_timesteps=num_timesteps, schedule=schedule,
         )
-        self.denoiser = LatentMLPDenoiser(
-            self.latent_dim,
+
+        self.normalizer = LatentNormalizer(self.latent_dim)
+
+        self.cond_pooler = ConditionPooler(
             self.cond_dim,
-            time_embed_dim=128,
-            hidden_dim=hidden_dim,
+            num_tokens=num_cond_tokens,
         )
+
+        self.denoiser = LatentDenoiser(
+            latent_dim=self.latent_dim,
+            cond_dim=self.cond_dim,
+            hidden_dim=hidden_dim,
+            time_embed_dim=time_embed_dim,
+            num_blocks=num_denoiser_blocks,
+            num_heads=num_heads,
+            num_latent_tokens=num_latent_tokens,
+        )
+
+    # --- helpers ----------------------------------------------------------
 
     def _move_scheduler(self, device: torch.device) -> None:
-        self.scheduler.betas = self.scheduler.betas.to(device)
-        self.scheduler.alphas = self.scheduler.alphas.to(device)
-        self.scheduler.alphas_cumprod = self.scheduler.alphas_cumprod.to(device)
-        self.scheduler.alphas_cumprod_prev = self.scheduler.alphas_cumprod_prev.to(
-            device
-        )
-        self.scheduler.sqrt_alphas_cumprod = self.scheduler.sqrt_alphas_cumprod.to(
-            device
-        )
-        self.scheduler.sqrt_one_minus_alphas_cumprod = (
-            self.scheduler.sqrt_one_minus_alphas_cumprod.to(device)
-        )
-        self.scheduler.sqrt_recip_alphas = self.scheduler.sqrt_recip_alphas.to(device)
-        self.scheduler.sqrt_recipm1_alphas = self.scheduler.sqrt_recipm1_alphas.to(
-            device
-        )
-        self.scheduler.posterior_variance = self.scheduler.posterior_variance.to(
-            device
-        )
-        self.scheduler.posterior_log_variance_clipped = (
-            self.scheduler.posterior_log_variance_clipped.to(device)
-        )
+        for attr in (
+            "betas",
+            "alphas",
+            "alphas_cumprod",
+            "alphas_cumprod_prev",
+            "sqrt_alphas_cumprod",
+            "sqrt_one_minus_alphas_cumprod",
+            "sqrt_recip_alphas",
+            "sqrt_recipm1_alphas",
+            "posterior_variance",
+            "posterior_log_variance_clipped",
+        ):
+            t = getattr(self.scheduler, attr)
+            if t.device != device:
+                setattr(self.scheduler, attr, t.to(device))
 
-    def encode_condition(self, partial_scan: Dict[str, torch.Tensor]) -> torch.Tensor:
+    def encode_condition(
+        self,
+        partial_scan: Dict[str, torch.Tensor],
+        batch_size: int,
+    ) -> torch.Tensor:
+        """Returns (B, num_cond_tokens, cond_dim)."""
         fused, _ = self.condition_extractor(partial_scan)
         batch = partial_scan["batch"]
-        bsz = int(batch.max().item()) + 1
-        return pool_per_point_to_batch(fused, batch, bsz)
+        return self.cond_pooler(fused, batch, batch_size)
+
+    # --- training ---------------------------------------------------------
 
     def forward_training(
         self,
@@ -131,87 +375,44 @@ class SceneCompletionLatentDiffusion(nn.Module):
         complete_coord: torch.Tensor,
         complete_batch: torch.Tensor,
         freeze_vae: bool = True,
-        use_posterior_sample: bool = False,
     ) -> Dict[str, torch.Tensor]:
-        """
-        Train denoiser with epsilon prediction loss in latent space.
-        z_0 is encoder mean mu (or reparameterized sample if use_posterior_sample).
-        """
+        """Epsilon-prediction loss in normalised latent space."""
         device = complete_coord.device
         self._move_scheduler(device)
-
         bsz = int(complete_batch.max().item()) + 1
-        cond = self.encode_condition(partial_scan)
+
+        cond = self.encode_condition(partial_scan, bsz)
 
         ctx = torch.no_grad() if freeze_vae else torch.enable_grad()
         with ctx:
             enc_out = self.vae.encode_batched(
-                complete_coord, complete_batch, bsz
+                complete_coord, complete_batch, bsz,
             )
 
-        # Gaussian VAE returns (mu, logvar). VQ-VAE returns z_q directly.
         if isinstance(enc_out, tuple) and len(enc_out) == 2:
-            mu, logvar = enc_out
-            if use_posterior_sample and not freeze_vae and hasattr(
-                self.vae, "reparameterize"
-            ):
-                z0 = self.vae.reparameterize(mu, logvar)
-            else:
-                z0 = mu
+            mu, _logvar = enc_out
+            z0 = mu
         else:
-            # VQ-VAE (or other latent models) return z0 directly.
             z0 = enc_out
 
+        if self.training:
+            self.normalizer.update(z0)
+        z0 = self.normalizer.normalize(z0)
+
         t = torch.randint(
-            0, self.scheduler.num_timesteps, (bsz,), device=device, dtype=torch.long
+            0, self.scheduler.num_timesteps, (bsz,),
+            device=device, dtype=torch.long,
         )
         noise = torch.randn_like(z0)
-        sa = self.scheduler.sqrt_alphas_cumprod.to(device)[t].unsqueeze(-1)
-        som = self.scheduler.sqrt_one_minus_alphas_cumprod.to(device)[t].unsqueeze(-1)
+        sa = self.scheduler.sqrt_alphas_cumprod[t].unsqueeze(-1)
+        som = self.scheduler.sqrt_one_minus_alphas_cumprod[t].unsqueeze(-1)
         z_t = sa * z0 + som * noise
 
-        pred_noise = self.denoiser(z_t, t, cond)
-        loss = F.mse_loss(pred_noise, noise)
-        return {"loss": loss, "pred_noise": pred_noise}
+        pred = self.denoiser(z_t, t, cond)
+        loss = F.mse_loss(pred, noise)
+        return {"loss": loss}
 
-    @torch.no_grad()
-    def p_sample_step(
-        self,
-        z: torch.Tensor,
-        t_int: int,
-        cond: torch.Tensor,
-        clip_denoised: bool = True,
-    ) -> torch.Tensor:
-        """Single reverse DDPM step; z (B, D), cond (B, cond_dim)."""
-        device = z.device
-        self._move_scheduler(device)
-        B = z.size(0)
-        t = torch.full((B,), t_int, device=device, dtype=torch.long)
-
-        pred_noise = self.denoiser(z, t, cond)
-
-        alpha_bar = self.scheduler.alphas_cumprod[t_int]
-        alpha_bar_prev = self.scheduler.alphas_cumprod_prev[t_int]
-        beta_t = self.scheduler.betas[t_int]
-        alpha_t = self.scheduler.alphas[t_int]
-
-        sqrt_ac = self.scheduler.sqrt_alphas_cumprod[t_int]
-        sqrt_om = self.scheduler.sqrt_one_minus_alphas_cumprod[t_int]
-
-        pred_z0 = (z - sqrt_om * pred_noise) / sqrt_ac
-        if clip_denoised:
-            pred_z0 = pred_z0.clamp(-10.0, 10.0)
-
-        if t_int == 0:
-            return pred_z0
-
-        posterior_mean = (
-            torch.sqrt(alpha_bar_prev) * beta_t / (1.0 - alpha_bar) * pred_z0
-            + torch.sqrt(alpha_t) * (1.0 - alpha_bar_prev) / (1.0 - alpha_bar) * z
-        )
-        posterior_var = self.scheduler.posterior_variance[t_int]
-        noise = torch.randn_like(z)
-        return posterior_mean + torch.sqrt(posterior_var) * noise
+    # --- inference --------------------------------------------------------
 
     @torch.no_grad()
     def complete_scene(
@@ -221,86 +422,66 @@ class SceneCompletionLatentDiffusion(nn.Module):
         sampling: str = "ddim",
         eta: float = 0.0,
     ) -> torch.Tensor:
-        """
-        Returns decoded point cloud (K, 3) for batch_size 1, else (B, K, 3).
-        """
+        """Denoise from pure noise → denormalize → decode with VAE → point cloud."""
         if num_steps is None:
             num_steps = self.denoising_steps
 
         device = next(self.denoiser.parameters()).device
         self._move_scheduler(device)
 
-        cond = self.encode_condition(partial_scan)
+        batch = partial_scan["batch"]
+        bsz = int(batch.max().item()) + 1
+        cond = self.encode_condition(partial_scan, bsz)
         B = cond.size(0)
+
         z = torch.randn(B, self.latent_dim, device=device)
 
-        timesteps = torch.linspace(
-            self.scheduler.num_timesteps - 1,
-            0,
-            num_steps,
-            dtype=torch.long,
-            device=device,
+        # Build monotone-decreasing timestep list ending at 0.
+        ts = torch.linspace(
+            self.scheduler.num_timesteps - 1, 0, num_steps,
+            dtype=torch.long, device=device,
         )
-        # If integer linspace skips values, `p_sample_step()` (t -> t-1) is no longer correct.
-        # Use DDIM update when steps are not adjacent.
-        ts_list = timesteps.tolist()
-        ts_unique = sorted(set(ts_list), reverse=True)
-        if 0 not in ts_unique:
-            ts_unique.append(0)
+        ts_list = sorted(set(int(v) for v in ts.tolist()), reverse=True)
+        if 0 not in ts_list:
+            ts_list.append(0)
 
-        sampling = sampling.lower()
-        use_ddpm = sampling == "ddpm" and all(
-            ts_unique[i] - 1 == ts_unique[i + 1]
-            for i in range(len(ts_unique) - 1)
-        )
+        # DDIM sampling (deterministic when eta=0).
+        for i in range(len(ts_list) - 1):
+            t_cur = ts_list[i]
+            t_prev = ts_list[i + 1]
 
-        if use_ddpm:
-            for t_int in ts_unique:
-                z = self.p_sample_step(z, int(t_int), cond)
-        else:
-            # DDIM-style latent sampling (epsilon-prediction parameterization).
-            # eta=0 gives deterministic sampling; higher eta adds stochasticity.
-            for i in range(len(ts_unique) - 1):
-                t = ts_unique[i]
-                t_prev = ts_unique[i + 1]
+            t_vec = torch.full((B,), t_cur, device=device, dtype=torch.long)
+            eps = self.denoiser(z, t_vec, cond)
 
-                t_tensor = torch.full(
-                    (B,), t, device=device, dtype=torch.long
+            ab = self.scheduler.alphas_cumprod[t_cur]
+            ab_prev = self.scheduler.alphas_cumprod[t_prev]
+
+            x0_pred = (z - torch.sqrt(1.0 - ab) * eps) / torch.sqrt(ab)
+
+            if eta == 0.0:
+                z = (
+                    torch.sqrt(ab_prev) * x0_pred
+                    + torch.sqrt(1.0 - ab_prev) * eps
                 )
-                eps = self.denoiser(z, t_tensor, cond)
+            else:
+                sigma = (
+                    eta
+                    * torch.sqrt((1.0 - ab_prev) / (1.0 - ab))
+                    * torch.sqrt(1.0 - ab / ab_prev)
+                )
+                z = (
+                    torch.sqrt(ab_prev) * x0_pred
+                    + torch.sqrt((1.0 - ab_prev - sigma ** 2).clamp(min=0)) * eps
+                    + sigma * torch.randn_like(z)
+                )
 
-                a_bar_t = self.scheduler.alphas_cumprod[t]
-                a_bar_prev = self.scheduler.alphas_cumprod[t_prev]
+        # Denormalize back to VAE latent scale.
+        z = self.normalizer.denormalize(z)
 
-                # x0 prediction from epsilon
-                sqrt_a_bar_t = torch.sqrt(a_bar_t)
-                sqrt_one_minus_a_bar_t = torch.sqrt(1.0 - a_bar_t)
-                x0_pred = (z - sqrt_one_minus_a_bar_t * eps) / sqrt_a_bar_t
-
-                # DDIM update
-                sqrt_a_bar_prev = torch.sqrt(a_bar_prev)
-                if eta == 0.0:
-                    z = (
-                        sqrt_a_bar_prev * x0_pred
-                        + torch.sqrt(1.0 - a_bar_prev) * eps
-                    )
-                else:
-                    sigma_t = (
-                        eta
-                        * torch.sqrt((1.0 - a_bar_prev) / (1.0 - a_bar_t))
-                        * torch.sqrt(1.0 - a_bar_t / a_bar_prev)
-                    )
-                    noise = torch.randn_like(z)
-                    z = (
-                        sqrt_a_bar_prev * x0_pred
-                        + torch.sqrt(torch.clamp(1.0 - a_bar_prev - sigma_t**2, min=0.0)) * eps
-                        + sigma_t * noise
-                    )
-
-        # If this is a VQ-VAE, map the final continuous latent back to the codebook
-        # before decoding (helps avoid drifting off-manifold).
+        # VQ-VAE: snap to nearest codebook entry before decoding.
         if hasattr(self.vae, "quantize"):
             z = self.vae.quantize(z)
+
         pts = self.vae.decode(z)
         if pts.dim() == 3 and pts.size(0) == 1:
             pts = pts.squeeze(0)
