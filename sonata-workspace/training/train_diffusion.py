@@ -50,6 +50,10 @@ def parse_args():
         '--voxel_size', type=float, default=0.05,
         help='Voxel size for scene representation'
     )
+    parser.add_argument(
+        '--max_points', type=int, default=20000,
+        help='Maximum points per sample (raise for denser GT)'
+    )
 
     # Model
     parser.add_argument(
@@ -421,6 +425,7 @@ def main():
         voxel_size=args.voxel_size,
         use_ground_truth_maps=True,
         augmentation=not use_precomputed,
+        max_points=args.max_points,
         use_precomputed=use_precomputed,
     )
 
@@ -430,6 +435,7 @@ def main():
         voxel_size=args.voxel_size,
         use_ground_truth_maps=True,
         augmentation=False,
+        max_points=args.max_points,
         use_precomputed=use_precomputed,
     )
 
