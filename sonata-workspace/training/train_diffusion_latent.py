@@ -47,7 +47,9 @@ def parse_args():
     p.add_argument("--gradient_clip", type=float, default=1.0)
     p.add_argument("--num_timesteps", type=int, default=1000)
     p.add_argument(
-        "--schedule", type=str, default="cosine",
+        "--schedule",
+        type=str,
+        default="cosine",
         choices=["linear", "cosine", "sigmoid"],
     )
     p.add_argument("--denoising_steps", type=int, default=50)
@@ -70,12 +72,7 @@ def parse_args():
     p.add_argument(
         "--train_vae",
         action="store_true",
-        help="Unfreeze VAE and train jointly with small diffusion loss on mu",
-    )
-    p.add_argument(
-        "--use_posterior_sample",
-        action="store_true",
-        help="If training VAE jointly, sample z ~ q(z|x) as z0 (noisy targets)",
+        help="Unfreeze VAE and train jointly (not recommended initially)",
     )
     p.add_argument("--fp16", action="store_true")
     p.add_argument(
@@ -84,6 +81,15 @@ def parse_args():
         default=None,
         help="YAML with keys matching argparse dest names",
     )
+
+    # --- denoiser architecture ---
+    p.add_argument("--hidden_dim", type=int, default=1024)
+    p.add_argument("--num_denoiser_blocks", type=int, default=8)
+    p.add_argument("--num_latent_tokens", type=int, default=8)
+    p.add_argument("--num_cond_tokens", type=int, default=32)
+    p.add_argument("--num_heads", type=int, default=4)
+    p.add_argument("--time_embed_dim", type=int, default=256)
+
     args = p.parse_args()
     if args.config is not None:
         cfg_path = os.path.expanduser(args.config)
@@ -104,8 +110,6 @@ def parse_args():
 def build_partial_dict(batch, voxel_size_sonata: float) -> dict:
     coord = batch["partial_coord"]
     gc = torch.floor(coord / voxel_size_sonata).long()
-    # Shift per batch sample so grid_coord is non-negative
-    # (required by Sonata serialization / hashing)
     batch_idx = batch["partial_batch"]
     for b in batch_idx.unique():
         mask = batch_idx == b
@@ -119,54 +123,172 @@ def build_partial_dict(batch, voxel_size_sonata: float) -> dict:
     }
 
 
-def _infer_vae_from_state_dict(sd: dict) -> tuple[str, int, int]:
-    """
+# ---------------------------------------------------------------------------
+# VAE checkpoint helpers
+# ---------------------------------------------------------------------------
+
+
+def _infer_vae_from_full_state_dict(sd: dict) -> tuple:
+    """From a SceneCompletionLatentDiffusion state dict (keys prefixed 'vae.'),
+    infer VAE type, latent_dim, K, num_codes, num_quantizers, and extra kwargs.
+
     Returns:
-        (vae_kind, latent_dim, num_decoded_points)
+        (kind, latent_dim, K, num_codes, num_quantizers, extra_kwargs)
     """
+    # --- Multi-token Gaussian VAE (v2) ---
+    if "vae.mu_proj.weight" in sd:
+        token_dim = sd["vae.mu_proj.weight"].shape[0]
+        internal_dim = sd["vae.mu_proj.weight"].shape[1]
+        nlt = sd["vae.enc_pooler.query"].shape[1]
+        latent_dim = nlt * token_dim
+        k = sd["vae.point_queries"].shape[1]
+        ndb = sum(
+            1 for key in sd
+            if key.startswith("vae.dec_blocks.") and key.endswith(".cross_attn.in_proj_weight")
+        )
+        extra = {
+            "num_latent_tokens": nlt,
+            "internal_dim": internal_dim,
+            "num_dec_blocks": ndb,
+        }
+        return "gaussian_vae", latent_dim, k, 0, 0, extra
+
+    # From here, legacy architectures that have vae.decoder_out.weight
     decoder_w = sd["vae.decoder_out.weight"]
     k = decoder_w.shape[0] // 3
 
+    # --- Legacy single-vector Gaussian VAE ---
     if "vae.fc_mu.weight" in sd:
         latent_dim = sd["vae.fc_mu.weight"].shape[0]
-        return "gaussian_vae", latent_dim, k
+        return "gaussian_vae", latent_dim, k, 0, 0, {}
+
+    # --- RVQ-based VQ-VAE ---
+    rvq_keys = [
+        key for key in sd
+        if key.startswith("vae.residual_vq.codebooks.") and key.endswith(".weight")
+    ]
+    if rvq_keys:
+        cb0 = sd["vae.residual_vq.codebooks.0.weight"]
+        latent_dim = cb0.shape[1]
+        num_codes = cb0.shape[0]
+        num_quantizers = len(rvq_keys)
+        return "vq_vae", latent_dim, k, num_codes, num_quantizers, {}
+
+    # --- Legacy single-codebook VQ-VAE ---
     if "vae.codebook.weight" in sd:
         latent_dim = sd["vae.codebook.weight"].shape[1]
-        return "vq_vae", latent_dim, k
+        num_codes = sd["vae.codebook.weight"].shape[0]
+        return "vq_vae", latent_dim, k, num_codes, 1, {}
 
     raise KeyError(
         "Could not infer VAE type from checkpoint. Expected keys like "
-        "'vae.fc_mu.weight' or 'vae.codebook.weight'."
+        "'vae.mu_proj.weight', 'vae.fc_mu.weight', or 'vae.residual_vq.codebooks.0.weight'."
     )
 
 
 def load_vae_from_checkpoint(path: str, device: torch.device):
+    """Load a standalone point-VAE or VQ-VAE checkpoint (keys without 'vae.' prefix)."""
     ck = torch.load(os.path.expanduser(path), map_location="cpu")
     sd = ck["model_state_dict"]
 
-    # Point VAE checkpoints do not have the "vae." prefix.
+    # --- Multi-token Gaussian VAE (v2) ---
+    if "mu_proj.weight" in sd:
+        token_dim = sd["mu_proj.weight"].shape[0]
+        internal_dim = sd["mu_proj.weight"].shape[1]
+        nlt = sd["enc_pooler.query"].shape[1]
+        k = sd["point_queries"].shape[1]
+        ndb = sum(
+            1 for key in sd
+            if key.startswith("dec_blocks.") and key.endswith(".cross_attn.in_proj_weight")
+        )
+        vae = PointCloudVAE(
+            latent_dim=nlt * token_dim,
+            num_decoded_points=k,
+            num_latent_tokens=nlt,
+            internal_dim=internal_dim,
+            num_dec_blocks=ndb,
+        )
+        vae.load_state_dict(sd)
+        return vae.to(device)
+
+    # Legacy architectures use decoder_out
     decoder_w = sd["decoder_out.weight"]
     k = decoder_w.shape[0] // 3
 
     if "fc_mu.weight" in sd:
-        latent_dim = sd["fc_mu.weight"].shape[0]
-        vae = PointCloudVAE(latent_dim=latent_dim, num_decoded_points=k)
-    elif "codebook.weight" in sd:
-        latent_dim = sd["codebook.weight"].shape[1]
-        num_codes = sd["codebook.weight"].shape[0]
+        raise KeyError(
+            "Legacy single-vector Gaussian VAE checkpoint detected. "
+            "This architecture has been replaced by the multi-token version. "
+            "Please retrain with the new training/train_point_vae.py."
+        )
+    elif "residual_vq.codebooks.0.weight" in sd:
+        cb0 = sd["residual_vq.codebooks.0.weight"]
+        latent_dim = cb0.shape[1]
+        num_codes = cb0.shape[0]
+        num_quantizers = sum(
+            1 for key in sd
+            if key.startswith("residual_vq.codebooks.") and key.endswith(".weight")
+        )
         vae = PointCloudVQVAE(
             latent_dim=latent_dim,
             num_codes=num_codes,
+            num_quantizers=num_quantizers,
             num_decoded_points=k,
         )
     else:
         raise KeyError(
-            "Could not infer VAE type from point VAE checkpoint. Expected "
-            "'fc_mu.weight' (Gaussian) or 'codebook.weight' (VQ-VAE)."
+            "Could not infer VAE type from checkpoint. Expected "
+            "'mu_proj.weight' (Gaussian v2) or 'residual_vq.codebooks.0.weight' (RVQ VQ-VAE)."
         )
 
     vae.load_state_dict(sd)
     return vae.to(device)
+
+
+# ---------------------------------------------------------------------------
+# Denoiser architecture inference from checkpoint
+# ---------------------------------------------------------------------------
+
+
+def _infer_denoiser_hparams(sd: dict) -> dict:
+    """Infer denoiser hyperparameters from state dict keys."""
+    hidden_dim = sd["denoiser.input_proj.weight"].shape[0]
+    latent_tokens = sd["denoiser.pos_embed"].shape[1]
+    time_embed_dim = sd["denoiser.time_proj.0.weight"].shape[1]
+    num_blocks = sum(
+        1 for k in sd if k.startswith("denoiser.blocks.") and k.endswith(".adaln_sa.norm.bias")
+    )
+    # Infer num_heads from self-attention in_proj weight shape
+    token_dim = hidden_dim // latent_tokens
+    sa_in_proj = sd["denoiser.blocks.0.self_attn.in_proj_weight"]
+    # in_proj_weight shape = (3*embed_dim, embed_dim) for MultiheadAttention
+    assert sa_in_proj.shape[0] == 3 * token_dim
+    # num_heads is not directly stored; try to infer from cross_attn out_proj
+    # or just check a reasonable default.  We can also look at the
+    # cond_pooler to find num_cond_tokens.
+    num_cond_tokens = sd["cond_pooler.query"].shape[1]
+
+    return {
+        "hidden_dim": hidden_dim,
+        "num_denoiser_blocks": num_blocks,
+        "num_latent_tokens": latent_tokens,
+        "time_embed_dim": time_embed_dim,
+        "num_cond_tokens": num_cond_tokens,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Training / validation loops
+# ---------------------------------------------------------------------------
+
+
+def collect_trainable_params(model: SceneCompletionLatentDiffusion, train_vae: bool):
+    params = [p for p in model.denoiser.parameters() if p.requires_grad]
+    params += [p for p in model.cond_pooler.parameters() if p.requires_grad]
+    params += [p for p in model.condition_extractor.parameters() if p.requires_grad]
+    if train_vae:
+        params += [p for p in model.vae.parameters() if p.requires_grad]
+    return params
 
 
 def train_epoch(model, loader, opt, epoch, args, writer, scaler, device, use_amp: bool):
@@ -190,7 +312,6 @@ def train_epoch(model, loader, opt, epoch, args, writer, scaler, device, use_amp
                 cc,
                 cb,
                 freeze_vae=not args.train_vae,
-                use_posterior_sample=args.use_posterior_sample,
             )
             loss = out["loss"]
 
@@ -210,7 +331,7 @@ def train_epoch(model, loader, opt, epoch, args, writer, scaler, device, use_amp
         lv = loss.item()
         tot += lv
         writer.add_scalar("train/loss", lv, epoch * len(loader) + i)
-    return tot / len(loader)
+    return tot / max(len(loader), 1)
 
 
 @torch.no_grad()
@@ -228,22 +349,35 @@ def validate(model, loader, args, writer, epoch, device, use_amp: bool):
                 batch["complete_coord"],
                 batch["complete_batch"],
                 freeze_vae=True,
-                use_posterior_sample=False,
             )
             tot += out["loss"].item()
-    avg = tot / len(loader)
+    avg = tot / max(len(loader), 1)
     writer.add_scalar("val/loss", avg, epoch)
     return avg
 
 
-def collect_trainable_params(model: SceneCompletionLatentDiffusion, train_vae: bool):
-    params = (
-        list(model.denoiser.parameters())
-        + list(model.condition_extractor.parameters())
-    )
-    if train_vae:
-        params += list(model.vae.parameters())
-    return params
+# ---------------------------------------------------------------------------
+# Checkpoint hyperparameters
+# ---------------------------------------------------------------------------
+
+
+def _model_hparams(args) -> dict:
+    """Collect architecture hyperparameters to store in checkpoints."""
+    return {
+        "num_timesteps": args.num_timesteps,
+        "schedule": args.schedule,
+        "hidden_dim": args.hidden_dim,
+        "num_denoiser_blocks": args.num_denoiser_blocks,
+        "num_latent_tokens": args.num_latent_tokens,
+        "num_cond_tokens": args.num_cond_tokens,
+        "num_heads": args.num_heads,
+        "time_embed_dim": args.time_embed_dim,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
 
 
 def main():
@@ -262,34 +396,51 @@ def main():
         feature_levels=[0],
     )
     cond_ext = ConditionalFeatureExtractor(
-        encoder, feature_levels=[0], fusion_type="concat"
+        encoder, feature_levels=[0], fusion_type="concat",
     )
 
     start = 0
     best = float("inf")
+
     if args.resume:
         ck0 = torch.load(os.path.expanduser(args.resume), map_location="cpu")
         sd0 = ck0["model_state_dict"]
-        vae_kind, ld, nk = _infer_vae_from_state_dict(sd0)
+        vae_kind, ld, nk, num_codes, num_q, vae_extra = _infer_vae_from_full_state_dict(sd0)
+
+        # Restore architecture hyperparams from checkpoint (fall back to CLI).
         num_t = ck0.get("num_timesteps", args.num_timesteps)
         sched = ck0.get("schedule", args.schedule)
+        hd = ck0.get("hidden_dim", args.hidden_dim)
+        ndb = ck0.get("num_denoiser_blocks", args.num_denoiser_blocks)
+        nlt = ck0.get("num_latent_tokens", args.num_latent_tokens)
+        nct = ck0.get("num_cond_tokens", args.num_cond_tokens)
+        nh = ck0.get("num_heads", args.num_heads)
+        ted = ck0.get("time_embed_dim", args.time_embed_dim)
+
         if vae_kind == "gaussian_vae":
-            vae = PointCloudVAE(latent_dim=ld, num_decoded_points=nk).to(device)
+            vae = PointCloudVAE(
+                latent_dim=ld, num_decoded_points=nk, **vae_extra,
+            ).to(device)
         elif vae_kind == "vq_vae":
-            num_codes = sd0["vae.codebook.weight"].shape[0]
             vae = PointCloudVQVAE(
-                latent_dim=ld,
-                num_codes=num_codes,
-                num_decoded_points=nk,
+                latent_dim=ld, num_codes=num_codes,
+                num_quantizers=max(num_q, 1), num_decoded_points=nk,
             ).to(device)
         else:
             raise ValueError(f"Unknown vae_kind: {vae_kind}")
+
         model = SceneCompletionLatentDiffusion(
             vae=vae,
             condition_extractor=cond_ext,
             num_timesteps=num_t,
             schedule=sched,
             denoising_steps=args.denoising_steps,
+            hidden_dim=hd,
+            num_denoiser_blocks=ndb,
+            num_latent_tokens=nlt,
+            num_cond_tokens=nct,
+            num_heads=nh,
+            time_embed_dim=ted,
         ).to(device)
         opt = optim.AdamW(
             collect_trainable_params(model, args.train_vae),
@@ -297,7 +448,7 @@ def main():
             weight_decay=args.weight_decay,
         )
         sch = optim.lr_scheduler.CosineAnnealingLR(
-            opt, T_max=args.num_epochs, eta_min=1e-6
+            opt, T_max=args.num_epochs, eta_min=1e-6,
         )
         ck = load_checkpoint(os.path.expanduser(args.resume), model, opt, sch)
         start = ck.get("epoch", 0) + 1
@@ -307,12 +458,19 @@ def main():
         if not args.train_vae:
             for p in vae.parameters():
                 p.requires_grad = False
+
         model = SceneCompletionLatentDiffusion(
             vae=vae,
             condition_extractor=cond_ext,
             num_timesteps=args.num_timesteps,
             schedule=args.schedule,
             denoising_steps=args.denoising_steps,
+            hidden_dim=args.hidden_dim,
+            num_denoiser_blocks=args.num_denoiser_blocks,
+            num_latent_tokens=args.num_latent_tokens,
+            num_cond_tokens=args.num_cond_tokens,
+            num_heads=args.num_heads,
+            time_embed_dim=args.time_embed_dim,
         ).to(device)
         opt = optim.AdamW(
             collect_trainable_params(model, args.train_vae),
@@ -320,7 +478,7 @@ def main():
             weight_decay=args.weight_decay,
         )
         sch = optim.lr_scheduler.CosineAnnealingLR(
-            opt, T_max=args.num_epochs, eta_min=1e-6
+            opt, T_max=args.num_epochs, eta_min=1e-6,
         )
 
     ds_tr = SemanticKITTI(
@@ -362,9 +520,14 @@ def main():
     use_amp = args.fp16 and device.type == "cuda"
     scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
 
+    hparams = _model_hparams(args)
+
     for epoch in range(start, args.num_epochs):
-        tr = train_epoch(model, tr_loader, opt, epoch, args, writer, scaler, device, use_amp)
+        tr = train_epoch(
+            model, tr_loader, opt, epoch, args, writer, scaler, device, use_amp,
+        )
         logger.info(f"Epoch {epoch} train {tr:.6f}")
+
         if (epoch + 1) % args.eval_freq == 0:
             va = validate(model, va_loader, args, writer, epoch, device, use_amp)
             logger.info(f"Val {va:.6f}")
@@ -378,12 +541,10 @@ def main():
                     sch,
                     epoch,
                     best_val_loss=best,
-                    additional_info={
-                        "num_timesteps": model.scheduler.num_timesteps,
-                        "schedule": model.scheduler.schedule,
-                    },
+                    additional_info=hparams,
                 )
                 logger.info(f"Saved {path}")
+
         if (epoch + 1) % args.save_freq == 0:
             path = os.path.join(args.output_dir, f"checkpoint_epoch_{epoch}.pth")
             save_checkpoint(
@@ -393,10 +554,7 @@ def main():
                 sch,
                 epoch,
                 best_val_loss=best,
-                additional_info={
-                    "num_timesteps": model.scheduler.num_timesteps,
-                    "schedule": model.scheduler.schedule,
-                },
+                additional_info=hparams,
             )
         sch.step()
 

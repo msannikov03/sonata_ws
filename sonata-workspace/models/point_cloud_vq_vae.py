@@ -1,8 +1,17 @@
 """
-Point cloud VQ-VAE: PointNet-style encoder -> vector quantization codebook -> MLP decoder
--> fixed K output points.
+Point cloud VQ-VAE with Residual Vector Quantization (RVQ).
 
-Loss = Chamfer reconstruction + codebook loss + commitment loss.
+Instead of a single codebook vector per scene (which gives only num_codes
+representable latent states), RVQ uses multiple quantization levels that
+progressively refine the residual.  With L levels of C codes each, the
+effective codebook size is C^L (e.g. 1024^8 ≈ 10^24).
+
+Architecture:
+  Encoder: PointNet-style shared MLP + global max-pool → z_e (D,)
+  Quantizer: L-level residual VQ → z_q = sum of L codebook entries (D,)
+  Decoder: MLP → K output points (K*3,)
+
+Loss = Chamfer(recon, target) + per-level codebook + commitment losses.
 """
 
 from __future__ import annotations
@@ -16,20 +25,142 @@ import torch.nn.functional as F
 from models.refinement_net import chamfer_distance
 
 
+# ---------------------------------------------------------------------------
+# Residual Vector Quantization
+# ---------------------------------------------------------------------------
+
+
+class ResidualVQ(nn.Module):
+    """Multi-level residual vector quantization.
+
+    Each level quantizes the residual left by previous levels.  The final
+    quantized representation is the sum of all per-level codes.  This keeps
+    the latent shape as (D,) or (B, D) — fully compatible with downstream
+    modules that expect a single latent vector.
+    """
+
+    def __init__(
+        self,
+        num_quantizers: int = 8,
+        num_codes: int = 1024,
+        dim: int = 256,
+        beta_commit: float = 0.25,
+    ):
+        super().__init__()
+        self.num_quantizers = num_quantizers
+        self.num_codes = num_codes
+        self.dim = dim
+        self.beta_commit = beta_commit
+        self.codebooks = nn.ModuleList(
+            [nn.Embedding(num_codes, dim) for _ in range(num_quantizers)]
+        )
+
+    def _nearest_indices(
+        self, z: torch.Tensor, codebook_weight: torch.Tensor,
+    ) -> torch.Tensor:
+        """Squared-L2 nearest-neighbor lookup.  z: (B, D)."""
+        dists = (
+            z.pow(2).sum(-1, keepdim=True)
+            - 2.0 * z @ codebook_weight.t()
+            + codebook_weight.pow(2).sum(-1).unsqueeze(0)
+        )
+        return dists.argmin(dim=-1)  # (B,)
+
+    def forward(self, z_e: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Args:
+            z_e: (D,) or (B, D) continuous encoder output.
+        Returns:
+            z_q: quantized latent (same shape), with straight-through gradients
+                 flowing back to z_e.
+            vq_loss: scalar combining codebook + commitment losses across all
+                     quantization levels.
+        """
+        single = z_e.dim() == 1
+        if single:
+            z_e = z_e.unsqueeze(0)
+
+        residual = z_e
+        z_q_sum = torch.zeros_like(z_e)
+        total_cb = z_e.new_tensor(0.0)
+        total_commit = z_e.new_tensor(0.0)
+
+        for codebook in self.codebooks:
+            indices = self._nearest_indices(residual.detach(), codebook.weight)
+            z_q_l = codebook(indices)  # (B, D) — has codebook gradients
+
+            total_cb = total_cb + F.mse_loss(z_q_l, residual.detach())
+            total_commit = total_commit + F.mse_loss(residual, z_q_l.detach())
+
+            # Straight-through: forward uses codebook value, backward goes to residual.
+            quantized_st = residual + (z_q_l - residual).detach()
+            z_q_sum = z_q_sum + quantized_st
+            residual = residual - quantized_st.detach()
+
+        vq_loss = total_cb + self.beta_commit * total_commit
+
+        if single:
+            z_q_sum = z_q_sum.squeeze(0)
+        return z_q_sum, vq_loss
+
+    @torch.no_grad()
+    def quantize(self, z: torch.Tensor) -> torch.Tensor:
+        """Inference-time sequential residual quantization (no gradients)."""
+        single = z.dim() == 1
+        if single:
+            z = z.unsqueeze(0)
+
+        residual = z
+        z_q_sum = torch.zeros_like(z)
+        for codebook in self.codebooks:
+            indices = self._nearest_indices(residual, codebook.weight)
+            z_q_l = codebook(indices)
+            z_q_sum = z_q_sum + z_q_l
+            residual = residual - z_q_l
+
+        if single:
+            z_q_sum = z_q_sum.squeeze(0)
+        return z_q_sum
+
+    @torch.no_grad()
+    def compute_usage(self, z_e: torch.Tensor) -> dict:
+        """Per-level codebook utilisation stats for monitoring collapse."""
+        single = z_e.dim() == 1
+        if single:
+            z_e = z_e.unsqueeze(0)
+        residual = z_e
+        usage = {}
+        for i, codebook in enumerate(self.codebooks):
+            indices = self._nearest_indices(residual, codebook.weight)
+            unique = indices.unique().numel()
+            usage[f"level_{i}_unique_codes"] = unique
+            usage[f"level_{i}_utilisation"] = unique / self.num_codes
+            z_q_l = codebook(indices)
+            residual = residual - z_q_l
+        return usage
+
+
+# ---------------------------------------------------------------------------
+# VQ-VAE with Residual VQ
+# ---------------------------------------------------------------------------
+
+
 class PointCloudVQVAE(nn.Module):
     """
-    Global (single-vector) VQ-VAE for point clouds.
+    Point cloud VQ-VAE with Residual Vector Quantization.
 
-    Encoder outputs a latent vector z_e (D).
-    Quantizer maps z_e to nearest codebook entry z_q (D) via straight-through.
-    Decoder maps z_q (D) -> (K, 3).
+    Encoder outputs continuous z_e (D).  ResidualVQ maps it to z_q (D)
+    via L levels of codebook lookup on successive residuals.
+    Decoder maps z_q → (K, 3).
     """
 
     def __init__(
         self,
         latent_dim: int = 256,
         num_codes: int = 1024,
+        num_quantizers: int = 8,
         num_decoded_points: int = 2048,
+        beta_commit: float = 0.25,
         encoder_widths: Optional[List[int]] = None,
         decoder_widths: Optional[List[int]] = None,
     ):
@@ -42,23 +173,27 @@ class PointCloudVQVAE(nn.Module):
 
         self.latent_dim = latent_dim
         self.num_codes = num_codes
+        self.num_quantizers = num_quantizers
         self.num_decoded_points = num_decoded_points
 
+        # --- Encoder (PointNet-style) ---
         enc_layers: List[nn.Module] = []
         d_in = 3
         for w in encoder_widths:
             enc_layers.extend([nn.Linear(d_in, w), nn.LayerNorm(w), nn.GELU()])
             d_in = w
         self.point_encoder = nn.Sequential(*enc_layers)
-        d_enc = encoder_widths[-1]
+        self.encoder_out = nn.Linear(encoder_widths[-1], latent_dim)
 
-        # Encoder output (continuous embedding) for quantization.
-        self.encoder_out = nn.Linear(d_enc, latent_dim)
+        # --- Residual VQ ---
+        self.residual_vq = ResidualVQ(
+            num_quantizers=num_quantizers,
+            num_codes=num_codes,
+            dim=latent_dim,
+            beta_commit=beta_commit,
+        )
 
-        # Codebook embeddings: (num_codes, latent_dim)
-        self.codebook = nn.Embedding(num_codes, latent_dim)
-        nn.init.uniform_(self.codebook.weight, -1.0 / num_codes, 1.0 / num_codes)
-
+        # --- Decoder (MLP) ---
         dec_layers: List[nn.Module] = []
         d = latent_dim
         for w in decoder_widths:
@@ -67,109 +202,28 @@ class PointCloudVQVAE(nn.Module):
         self.decoder_backbone = nn.Sequential(*dec_layers)
         self.decoder_out = nn.Linear(d, num_decoded_points * 3)
 
+    # ---- encoding --------------------------------------------------------
+
     def encode_continuous(self, points: torch.Tensor) -> torch.Tensor:
-        """
-        Args:
-            points: (N, 3)
-        Returns:
-            z_e: (latent_dim,)
-        """
+        """(N, 3) → z_e (latent_dim,)."""
         if points.dim() != 2 or points.size(-1) != 3:
             raise ValueError(f"Expected (N, 3) points, got {tuple(points.shape)}")
         if points.size(0) == 0:
             return points.new_zeros(self.latent_dim)
+        feat = self.point_encoder(points)
+        pooled = feat.max(dim=0).values
+        return self.encoder_out(pooled)
 
-        feat = self.point_encoder(points)  # (N, d_enc)
-        pooled = feat.max(dim=0).values  # (d_enc,)
-        return self.encoder_out(pooled)  # (D,)
+    # ---- quantization (inference-time, no grad) --------------------------
 
-    @torch.no_grad()
-    def quantize(self, z_e: torch.Tensor) -> torch.Tensor:
-        """
-        Quantize latent vectors to nearest codebook entries (no grad).
-        Used at inference time.
-        """
-        single = z_e.dim() == 1
-        if single:
-            z_e = z_e.unsqueeze(0)
-        code = self.codebook.weight
-        dists = (z_e.unsqueeze(1) - code.unsqueeze(0)).pow(2).sum(dim=-1)
-        indices = dists.argmin(dim=-1)
-        z_q = self.codebook(indices)
-        if single:
-            z_q = z_q.squeeze(0)
-        return z_q
+    def quantize(self, z: torch.Tensor) -> torch.Tensor:
+        """Inference-time residual quantization. (B,D) or (D,) → same shape."""
+        return self.residual_vq.quantize(z)
 
-    def quantize_with_grad(self, z_e: torch.Tensor) -> torch.Tensor:
-        """
-        Quantize with gradient flowing to codebook embeddings.
-        Finds nearest index without grad, then does lookup with grad.
-        """
-        single = z_e.dim() == 1
-        if single:
-            z_e = z_e.unsqueeze(0)
-        with torch.no_grad():
-            code = self.codebook.weight
-            dists = (z_e.unsqueeze(1) - code.unsqueeze(0)).pow(2).sum(dim=-1)
-            indices = dists.argmin(dim=-1)
-        z_q = self.codebook(indices)  # grad flows to codebook
-        if single:
-            z_q = z_q.squeeze(0)
-        return z_q
-
-    def forward(
-        self,
-        points: torch.Tensor,
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        """
-        Args:
-            points: (N, 3)
-        Returns:
-            recon: (K, 3)
-            z_e: (D,) continuous embedding
-            z_q_st: (D,) quantized embedding with straight-through gradients
-            z_q: (D,) quantized embedding with codebook gradients
-        """
-        z_e = self.encode_continuous(points)  # (D,)
-        z_q = self.quantize_with_grad(z_e)  # (D,) grad to codebook
-
-        # Straight-through estimator: forward uses z_q, backward uses z_e gradients.
-        z_q_st = z_e + (z_q - z_e).detach()
-
-        recon = self.decode(z_q_st)
-        return recon, z_e, z_q_st, z_q
-
-    def encode_batched(
-        self,
-        points: torch.Tensor,
-        batch: torch.Tensor,
-        batch_size: int,
-    ) -> torch.Tensor:
-        """
-        Encode a flat concatenated batch, returning quantized latents z_q.
-
-        Args:
-            points: (N_tot, 3)
-            batch: (N_tot,) integer batch indices in [0, B)
-        Returns:
-            z_q: (B, latent_dim)
-        """
-        zs = []
-        for b in range(batch_size):
-            mask = batch == b
-            pb = points[mask]
-            z_e = self.encode_continuous(pb)
-            z_q = self.quantize(z_e)
-            zs.append(z_q)
-        return torch.stack(zs, dim=0)
+    # ---- decoding --------------------------------------------------------
 
     def decode(self, z: torch.Tensor) -> torch.Tensor:
-        """
-        Args:
-            z: (D,) or (B, D)
-        Returns:
-            (K, 3) or (B, K, 3)
-        """
+        """(D,) or (B, D) → (K, 3) or (B, K, 3)."""
         single = z.dim() == 1
         if single:
             z = z.unsqueeze(0)
@@ -179,40 +233,38 @@ class PointCloudVQVAE(nn.Module):
             out = out.squeeze(0)
         return out
 
+    # ---- training forward ------------------------------------------------
 
-def vq_vae_reconstruction_chamfer(
-    recon: torch.Tensor,
-    target: torch.Tensor,
-    z_e: torch.Tensor,
-    z_q_st: torch.Tensor,
-    beta_commit: float = 0.25,
-    beta_codebook: float = 1.0,
-    z_q: torch.Tensor = None,
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """
-    Reconstruction + VQ losses.
+    def forward(
+        self, points: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """
+        Args:
+            points: (N, 3)
+        Returns:
+            recon: (K, 3)
+            z_e: (D,) continuous encoder output
+            z_q: (D,) quantized (sum of residual codes), straight-through
+            vq_loss: scalar VQ loss (codebook + commitment across all levels)
+        """
+        z_e = self.encode_continuous(points)
+        z_q, vq_loss = self.residual_vq(z_e)
+        recon = self.decode(z_q)
+        return recon, z_e, z_q, vq_loss
 
-    Args:
-        recon: (K, 3) reconstructed points
-        target: (M, 3) target points
-        z_e: (D,) encoder output embedding
-        z_q_st: (D,) quantized latent (straight-through tensor)
-        z_q: (D,) quantized embedding with codebook gradients
-    Returns:
-        total, recon_term, codebook_term, commit_term
-    """
-    recon_term = chamfer_distance(recon, target)
+    # ---- batched encoding for latent diffusion ---------------------------
 
-    # Use z_q with grad if provided, otherwise fall back (broken but backward compat)
-    if z_q is None:
-        z_q = z_q_st.detach()
-
-    # Codebook loss: move codebook toward encoder output (grad to codebook only)
-    codebook_term = F.mse_loss(z_q, z_e.detach())
-
-    # Commitment loss: encourage encoder to stay close to codebook (grad to encoder only)
-    commit_term = F.mse_loss(z_e, z_q.detach())
-
-    total = recon_term + beta_codebook * codebook_term + beta_commit * commit_term
-    return total, recon_term, codebook_term, commit_term
-
+    def encode_batched(
+        self,
+        points: torch.Tensor,
+        batch: torch.Tensor,
+        batch_size: int,
+    ) -> torch.Tensor:
+        """Returns (B, latent_dim) quantized latents for diffusion targets."""
+        zs = []
+        for b in range(batch_size):
+            mask = batch == b
+            z_e = self.encode_continuous(points[mask])
+            z_q = self.residual_vq.quantize(z_e.unsqueeze(0)).squeeze(0)
+            zs.append(z_q)
+        return torch.stack(zs, dim=0)
