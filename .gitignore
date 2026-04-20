@@ -1,7 +1,72 @@
+## Python
 __pycache__/
 *.pyc
+*.pyo
+*.pyd
+.Python
+
+## Envs / system
 venv/
 env/
+.venv/
+.env
 .DS_Store
+.ipynb_checkpoints/
+
+## Logs
 *.log
-.ipynb_checkpoints
+logs/
+**/logs/
+
+## Model checkpoints (large, do not track)
+checkpoints/
+**/checkpoints/
+*.pth
+*.ckpt
+*.safetensors
+
+## Local/editor/tmp
+*.bak
+*.tmp
+*.swp
+*.local
+*.patch
+
+## Eval run outputs (large directories with per-frame dumps; we commit only
+## the compact `all_metrics.json` summaries we need for paper numbers)
+eval_v1gt_fullval_logs/
+eval_v2gt_fullval_logs/
+evaluation_degradation/
+evaluation_degradation_v2gt_fixed/
+evaluation_fixed_v2gt/
+evaluation_fusion/
+evaluation_gaussian_vae/
+evaluation_latent_gaussian/
+evaluation_results/
+evaluation_results_full/
+evaluation_results_latent/
+evaluation_results_latent_ddim/
+evaluation_results_latent_v2_final/
+evaluation_results_v2gt/
+evaluation_results_v2gt_final/
+evaluation_student_on_lidar/
+evaluation_student_v2gt_mid/
+evaluation_teacher_on_da2/
+evaluation_vae_multitoken/
+evaluation_vae_v3/
+evaluation_vae_v3_clean/
+evaluation_vae_v3_clean_sampled/
+evaluation_vae_v3_sampled/
+gradient_analysis_results/
+results/
+
+## Per-frame prediction dumps inside fullval dirs (keep only summary json)
+eval_v1gt_fullval/**/per_frame*
+eval_v2gt_fullval/**/per_frame*
+eval_v1gt_fullval/**/*.npz
+eval_v2gt_fullval/**/*.npz
+
+## Additional runtime outputs
+uncertainty_results_da2/
+uncertainty_results_lidar/
+**/uncertainty_results_*/
