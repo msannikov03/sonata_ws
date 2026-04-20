@@ -180,6 +180,58 @@ class DiffusionScheduler:
             return pred_x0
 
 
+
+    def ddim_sample_step(
+        self,
+        model,
+        x_t,
+        coords,
+        t_cur,
+        t_prev,
+        condition,
+        eta=0.0,
+    ):
+        """
+        Single DDIM sampling step from t_cur to t_prev.
+        Coordinates (spatial scaffold) are FIXED -- only x_t features evolve.
+        """
+        device = x_t.device
+        self._to_device(device)
+
+        t_tensor = torch.full((1,), t_cur, device=device)
+        pred_noise = model(x_t, coords, t_tensor, condition)
+
+        sqrt_alpha_bar_t = self.sqrt_alphas_cumprod[t_cur]
+        sqrt_one_minus_alpha_bar_t = self.sqrt_one_minus_alphas_cumprod[t_cur]
+
+        # Predict x_0
+        pred_x0 = (x_t - sqrt_one_minus_alpha_bar_t * pred_noise) / sqrt_alpha_bar_t
+
+        if t_prev <= 0:
+            return pred_x0
+
+        alpha_bar_t = self.alphas_cumprod[t_cur]
+        alpha_bar_prev = self.alphas_cumprod[t_prev]
+        sqrt_alpha_bar_prev = torch.sqrt(alpha_bar_prev)
+
+        # DDIM variance
+        sigma = eta * torch.sqrt(
+            (1.0 - alpha_bar_prev) / (1.0 - alpha_bar_t) * (1.0 - alpha_bar_t / alpha_bar_prev)
+        )
+
+        # Direction pointing to x_t
+        pred_dir = torch.sqrt(1.0 - alpha_bar_prev - sigma ** 2) * pred_noise
+
+        # x_{t_prev}
+        x_prev = sqrt_alpha_bar_prev * pred_x0 + pred_dir
+
+        if eta > 0:
+            noise = torch.randn_like(x_t)
+            x_prev = x_prev + sigma * noise
+
+        return x_prev
+
+
 class SonataTransformerBlock(nn.Module):
     """
     Sonata-style transformer block for point cloud processing.
@@ -831,6 +883,55 @@ class SceneCompletionDiffusion(nn.Module):
             x_t = self.scheduler.p_sample_step(
                 self.denoiser, x_t, coords, t,
                 {'features': cond_features}
+            )
+
+        return x_t
+
+
+    @torch.no_grad()
+    def complete_scene_ddim(
+        self,
+        partial_scan,
+        target_coords,
+        num_steps=10,
+        start_t=200,
+        eta=0.0,
+    ):
+        """
+        DDIM multi-step inference with GT coordinate scaffold.
+        Coordinates are FIXED throughout -- only x_t features evolve.
+        """
+        device = target_coords.device
+        self.scheduler._to_device(device)
+
+        # Extract conditioning features
+        cond_features, _ = self.condition_extractor(partial_scan)
+        cond_features = knn_interpolate(cond_features, partial_scan["coord"], target_coords)
+        condition = {"features": cond_features}
+
+        # Build timestep schedule: start_t -> 0 in num_steps evenly spaced steps
+        timesteps = list(reversed(
+            [int(x) for x in torch.linspace(0, start_t, num_steps + 1)]
+        ))
+        # timesteps = [start_t, ..., 0]
+
+        # Initialize x_t by noising target_coords at start_t
+        noise = torch.randn_like(target_coords)
+        sa = self.scheduler.sqrt_alphas_cumprod[start_t]
+        som = self.scheduler.sqrt_one_minus_alphas_cumprod[start_t]
+        x_t = sa * target_coords + som * noise
+
+        # DDIM reverse process
+        for i in range(len(timesteps) - 1):
+            t_cur = timesteps[i]
+            t_prev = timesteps[i + 1]
+
+            if t_cur <= 0:
+                break
+
+            x_t = self.scheduler.ddim_sample_step(
+                self.denoiser, x_t, target_coords, t_cur, t_prev,
+                condition, eta=eta
             )
 
         return x_t

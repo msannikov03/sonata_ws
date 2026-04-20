@@ -65,43 +65,79 @@ class SonataEncoder(nn.Module):
         })
         
     def _load_pretrained(
-        self, 
+        self,
         model_id: str,
         enable_flash: bool,
         custom_config: Optional[Dict]
     ):
-        """Load pre-trained Sonata model."""
+        """Load pre-trained or randomly initialized Sonata model."""
         try:
-            # Try loading from Hugging Face
-            if custom_config is None:
-                custom_config = {}
-            
-            if not enable_flash:
-                custom_config['enable_flash'] = False
-                custom_config['enc_patch_size'] = [128] * 5  # Reduced for 24GB GPU
-            
-            # Import Sonata model
-            try:
-                from sonata.model import PointTransformerV3
-                model = PointTransformerV3.from_pretrained(
-                    model_id, **custom_config
-                )
-            except ImportError:
-                print("Sonata not installed as package, trying direct import...")
-                # Add fallback for standalone mode
-                import sys
-                sys.path.insert(0, './sonata')
-                from model import PointTransformerV3
-                model = PointTransformerV3.from_pretrained(
-                    model_id, **custom_config
-                )
-                
+            from sonata.model import PointTransformerV3
+        except ImportError:
+            print("Sonata not installed as package, trying direct import...")
+            import sys
+            sys.path.insert(0, './sonata')
+            from model import PointTransformerV3
+
+        if custom_config is None:
+            custom_config = {}
+
+        if not enable_flash:
+            custom_config['enable_flash'] = False
+            custom_config['enc_patch_size'] = [128] * 5  # Reduced for 24GB GPU
+
+        if model_id == "random":
+            # Build PTv3 with EXACT same architecture as facebook/sonata pretrained
+            # but with randomly initialized weights (no pretrained loading).
+            # Config extracted from HF cache: facebook/sonata config.json
+            random_config = dict(
+                in_channels=9,
+                order=("z", "z-trans", "hilbert", "hilbert-trans"),
+                stride=(2, 2, 2, 2),
+                enc_depths=(3, 3, 3, 12, 3),
+                enc_channels=(48, 96, 192, 384, 512),
+                enc_num_head=(3, 6, 12, 24, 32),
+                enc_patch_size=(1024, 1024, 1024, 1024, 1024),
+                dec_depths=(3, 3, 3, 3),
+                dec_channels=(96, 96, 192, 384),
+                dec_num_head=(6, 6, 12, 32),
+                dec_patch_size=(1024, 1024, 1024, 1024, 1024),
+                mlp_ratio=4,
+                qkv_bias=True,
+                qk_scale=None,
+                attn_drop=0.0,
+                proj_drop=0.0,
+                drop_path=0.3,
+                layer_scale=None,
+                pre_norm=True,
+                shuffle_orders=True,
+                enable_rpe=False,
+                enable_flash=True,
+                upcast_attention=False,
+                upcast_softmax=False,
+                traceable=True,
+                mask_token=True,
+                enc_mode=True,
+                freeze_encoder=False,
+            )
+            # Apply custom overrides (e.g. enable_flash=False, enc_patch_size)
+            random_config.update(custom_config)
+            model = PointTransformerV3(**random_config)
+            n_params = sum(p.numel() for p in model.parameters()) / 1e6
+            print(f"[SonataEncoder] RANDOM init PTv3 ({n_params:.1f}M params) "
+                  f"- same architecture as facebook/sonata, NO pretrained weights")
             return model
-            
+
+        try:
+            model = PointTransformerV3.from_pretrained(
+                model_id, **custom_config
+            )
+            return model
         except Exception as e:
             print(f"Error loading Sonata model: {e}")
             raise
-    
+
+
     def _freeze_encoder(self):
         """Freeze encoder parameters."""
         for param in self.encoder.parameters():

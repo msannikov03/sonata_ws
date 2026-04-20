@@ -6,11 +6,17 @@ Implements standard SSC metrics:
 - Chamfer distance
 - Semantic IoU
 - Mean IoU across classes
+
+Added Apr 17 for RA-L paper comparability with LiDiff / ScoreLiDAR / LiNeXt / LiFlow:
+- Jensen-Shannon Divergence (BEV voxelized, 0.5m) — LiDiff protocol
+- F-score @ 0.1m, 0.2m
+- Voxel IoU @ 0.1m, 0.2m (bridges to SSC: MonoScene, VoxFormer, CGFormer)
+- Hausdorff-95 (95th percentile directed distance, worst-case geometry)
 """
 
 import torch
 import numpy as np
-from typing import Dict, List, Tuple
+from typing import Dict, List, Tuple, Optional
 from scipy.spatial import cKDTree
 
 
@@ -268,6 +274,243 @@ def evaluate_scene_completion(
     return metrics.compute()
 
 
+# =============================================================================
+# Extended metrics for RA-L paper (Apr 17)
+# =============================================================================
+
+def _as_np(x) -> np.ndarray:
+    """Convert torch tensor or numpy array to numpy float32 array (N, 3)."""
+    if isinstance(x, torch.Tensor):
+        x = x.detach().cpu().numpy()
+    return np.asarray(x, dtype=np.float32)
+
+
+def jsd_bev(
+    pred_pts,
+    gt_pts,
+    voxel_size: float = 0.5,
+    bbox_min: Optional[Tuple[float, float]] = None,
+    bbox_max: Optional[Tuple[float, float]] = None,
+) -> float:
+    """
+    Jensen-Shannon Divergence in BEV (top-down, X-Y) between two point clouds.
+
+    Matches the LiDiff / ScoreLiDAR protocol: voxelize to a 2D BEV grid at
+    voxel_size resolution, normalize the occupancy histogram into a probability
+    distribution over cells, then compute the symmetric JSD.
+
+    Args:
+        pred_pts: (N, 3) predicted points
+        gt_pts:   (M, 3) ground-truth points
+        voxel_size: BEV cell size in meters (LiDiff uses 0.5)
+        bbox_min/bbox_max: optional (x_min, y_min) / (x_max, y_max). If None,
+            computed from the joint support of the two clouds.
+
+    Returns:
+        JSD in [0, log(2)] where 0 means identical distributions.
+    """
+    pred = _as_np(pred_pts)[:, :2]
+    gt = _as_np(gt_pts)[:, :2]
+    if len(pred) == 0 or len(gt) == 0:
+        return float("nan")
+
+    joint = np.concatenate([pred, gt], axis=0)
+    if bbox_min is None:
+        bbox_min = (joint[:, 0].min(), joint[:, 1].min())
+    if bbox_max is None:
+        bbox_max = (joint[:, 0].max(), joint[:, 1].max())
+
+    x_min, y_min = bbox_min
+    x_max, y_max = bbox_max
+    nx = max(1, int(np.ceil((x_max - x_min) / voxel_size)))
+    ny = max(1, int(np.ceil((y_max - y_min) / voxel_size)))
+
+    def _hist(pts):
+        ix = np.clip(((pts[:, 0] - x_min) / voxel_size).astype(np.int64), 0, nx - 1)
+        iy = np.clip(((pts[:, 1] - y_min) / voxel_size).astype(np.int64), 0, ny - 1)
+        flat = ix * ny + iy
+        h = np.bincount(flat, minlength=nx * ny).astype(np.float64)
+        s = h.sum()
+        if s <= 0:
+            return None
+        return h / s
+
+    p = _hist(pred)
+    q = _hist(gt)
+    if p is None or q is None:
+        return float("nan")
+
+    m = 0.5 * (p + q)
+
+    def _kl(a, b):
+        mask = (a > 0) & (b > 0)
+        return float(np.sum(a[mask] * (np.log(a[mask]) - np.log(b[mask]))))
+
+    jsd = 0.5 * _kl(p, m) + 0.5 * _kl(q, m)
+    return float(jsd)
+
+
+def f_score(pred_pts, gt_pts, threshold: float = 0.2) -> Dict[str, float]:
+    """
+    F-score at a distance threshold (meters).
+
+    Precision: fraction of predicted points whose nearest GT neighbor is <= threshold.
+    Recall:    fraction of GT points whose nearest predicted neighbor is <= threshold.
+    F-score:   harmonic mean of precision and recall.
+
+    Returns dict with keys: precision, recall, f_score.
+    """
+    pred = _as_np(pred_pts)
+    gt = _as_np(gt_pts)
+    if len(pred) == 0 or len(gt) == 0:
+        return {"precision": 0.0, "recall": 0.0, "f_score": 0.0}
+
+    gt_tree = cKDTree(gt)
+    pred_tree = cKDTree(pred)
+
+    d_p2g, _ = gt_tree.query(pred, k=1)
+    d_g2p, _ = pred_tree.query(gt, k=1)
+
+    precision = float((d_p2g <= threshold).mean())
+    recall = float((d_g2p <= threshold).mean())
+    if precision + recall == 0:
+        f = 0.0
+    else:
+        f = 2.0 * precision * recall / (precision + recall)
+    return {"precision": precision, "recall": recall, "f_score": f}
+
+
+def voxel_iou(pred_pts, gt_pts, voxel_size: float = 0.2) -> float:
+    """
+    IoU of occupied voxels between two point clouds.
+
+    Voxelizes both clouds with a shared origin (min of joint support) at
+    voxel_size resolution, then IoU = |pred ∩ gt| / |pred ∪ gt|.
+
+    This bridges to SSC literature: MonoScene (11.1 mIoU), VoxFormer (13.4),
+    CGFormer (16.6) — though their IoU is semantic per-class; here we report
+    geometric occupancy IoU.
+    """
+    pred = _as_np(pred_pts)
+    gt = _as_np(gt_pts)
+    if len(pred) == 0 or len(gt) == 0:
+        return 0.0
+
+    joint = np.concatenate([pred, gt], axis=0)
+    origin = joint.min(axis=0)
+
+    def _vox(pts):
+        v = np.floor((pts - origin) / voxel_size).astype(np.int64)
+        # Pack to a single int64 key: assume bounded coordinates
+        # Use a hashable per-row view via tobytes
+        return {tuple(row) for row in v}
+
+    set_p = _vox(pred)
+    set_g = _vox(gt)
+
+    inter = len(set_p & set_g)
+    union = len(set_p | set_g)
+    if union == 0:
+        return 0.0
+    return float(inter) / float(union)
+
+
+def hausdorff_95(pred_pts, gt_pts) -> float:
+    """
+    Hausdorff-95 distance: max of the 95th-percentile directed distances
+    pred->gt and gt->pred.
+
+    This is the worst-case geometric error (with outliers trimmed), a standard
+    robustness metric. Units: meters.
+    """
+    pred = _as_np(pred_pts)
+    gt = _as_np(gt_pts)
+    if len(pred) == 0 or len(gt) == 0:
+        return float("nan")
+
+    gt_tree = cKDTree(gt)
+    pred_tree = cKDTree(pred)
+    d_p2g, _ = gt_tree.query(pred, k=1)
+    d_g2p, _ = pred_tree.query(gt, k=1)
+
+    h95_p2g = float(np.percentile(d_p2g, 95))
+    h95_g2p = float(np.percentile(d_g2p, 95))
+    return max(h95_p2g, h95_g2p)
+
+
+def chamfer_distance_np(pred_pts, gt_pts) -> float:
+    """
+    Symmetric Chamfer distance (mean of directed mean Euclidean distances), scipy.
+    Linear (meters), provided for offline / CPU-only metrics computation.
+    """
+    pred = _as_np(pred_pts)
+    gt = _as_np(gt_pts)
+    if len(pred) == 0 or len(gt) == 0:
+        return float("nan")
+    gt_tree = cKDTree(gt)
+    pred_tree = cKDTree(pred)
+    d_p2g, _ = gt_tree.query(pred, k=1)
+    d_g2p, _ = pred_tree.query(gt, k=1)
+    return float((d_p2g.mean() + d_g2p.mean()) / 2.0)
+
+
+def chamfer_distance_sq_np(pred_pts, gt_pts) -> float:
+    """
+    Legacy squared Chamfer distance matching models.refinement_net.chamfer_distance.
+    Returned in m^2. Use this to compare against previously reported numbers
+    (e.g., teacher v2GT CD 0.039 was squared).
+    """
+    pred = _as_np(pred_pts)
+    gt = _as_np(gt_pts)
+    if len(pred) == 0 or len(gt) == 0:
+        return float("nan")
+    gt_tree = cKDTree(gt)
+    pred_tree = cKDTree(pred)
+    d_p2g, _ = gt_tree.query(pred, k=1)
+    d_g2p, _ = pred_tree.query(gt, k=1)
+    return float(((d_p2g ** 2).mean() + (d_g2p ** 2).mean()) / 2.0)
+
+
+def compute_all_metrics(
+    pred_pts,
+    gt_pts,
+    f_thresholds: Tuple[float, ...] = (0.1, 0.2),
+    iou_voxel_sizes: Tuple[float, ...] = (0.1, 0.2),
+    jsd_voxel_size: float = 0.5,
+    jsd_bbox: Optional[Tuple[Tuple[float, float], Tuple[float, float]]] = None,
+) -> Dict[str, float]:
+    """
+    Compute the full RA-L metric suite for a single prediction/GT pair.
+
+    Returns a flat dict with keys:
+        cd, jsd, f_score@0.1, f_score@0.2, precision@0.1, precision@0.2,
+        recall@0.1, recall@0.2, iou@0.1, iou@0.2, hausdorff_95
+    """
+    out: Dict[str, float] = {}
+    out["cd"] = chamfer_distance_np(pred_pts, gt_pts)
+    out["cd_sq"] = chamfer_distance_sq_np(pred_pts, gt_pts)
+
+    if jsd_bbox is None:
+        out["jsd"] = jsd_bev(pred_pts, gt_pts, voxel_size=jsd_voxel_size)
+    else:
+        out["jsd"] = jsd_bev(
+            pred_pts, gt_pts, voxel_size=jsd_voxel_size,
+            bbox_min=jsd_bbox[0], bbox_max=jsd_bbox[1],
+        )
+
+    for t in f_thresholds:
+        fs = f_score(pred_pts, gt_pts, threshold=t)
+        out[f"precision@{t}"] = fs["precision"]
+        out[f"recall@{t}"] = fs["recall"]
+        out[f"f_score@{t}"] = fs["f_score"]
+
+    for v in iou_voxel_sizes:
+        out[f"iou@{v}"] = voxel_iou(pred_pts, gt_pts, voxel_size=v)
+
+    out["hausdorff_95"] = hausdorff_95(pred_pts, gt_pts)
+    return out
+
+
 if __name__ == "__main__":
     # Test metrics
     print("Testing Completion Metrics...")
@@ -303,6 +546,43 @@ if __name__ == "__main__":
     
     metrics = CompletionMetrics()
     metrics.update(pred_points, gt_points, pred_labels, gt_labels)
-    
+
     print("\nWith semantic labels:")
     print(metrics)
+
+    # -----------------------------------------------------------------
+    # Sanity checks for the RA-L metric suite
+    # -----------------------------------------------------------------
+    print("\n=== RA-L metrics sanity checks ===")
+    rng = np.random.default_rng(0)
+    pts = rng.uniform(-20, 20, size=(5000, 3)).astype(np.float32)
+
+    print("\n[case 1] identical clouds (expect CD~0, JSD~0, F~1, IoU~1, H95~0):")
+    m_id = compute_all_metrics(pts, pts)
+    for k, v in m_id.items():
+        print(f"  {k}: {v:.6f}")
+    assert m_id["cd"] < 1e-6
+    assert m_id["jsd"] < 1e-6
+    assert m_id["f_score@0.1"] > 0.99
+    assert m_id["iou@0.1"] > 0.99
+    assert m_id["hausdorff_95"] < 1e-6
+
+    print("\n[case 2] offset by 1m along x (expect CD~1, F@0.1~0, F@0.2~0, H95~1):")
+    m_off = compute_all_metrics(pts + np.array([1.0, 0.0, 0.0], np.float32), pts)
+    for k, v in m_off.items():
+        print(f"  {k}: {v:.6f}")
+    assert 0.9 < m_off["cd"] < 1.1
+    assert m_off["f_score@0.1"] < 0.05
+    assert m_off["f_score@0.2"] < 0.05
+    assert 0.9 < m_off["hausdorff_95"] < 1.1
+
+    print("\n[case 3] offset by 0.05m (expect F@0.1~1, F@0.2~1, IoU@0.2 still high):")
+    m_small = compute_all_metrics(
+        pts + np.array([0.05, 0.0, 0.0], np.float32), pts
+    )
+    for k, v in m_small.items():
+        print(f"  {k}: {v:.6f}")
+    assert m_small["f_score@0.1"] > 0.9
+    assert m_small["f_score@0.2"] > 0.95
+
+    print("\nAll sanity checks passed.")
