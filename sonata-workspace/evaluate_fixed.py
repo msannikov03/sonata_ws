@@ -14,6 +14,15 @@ from models.sonata_encoder import SonataEncoder, ConditionalFeatureExtractor
 from models.diffusion_module import SceneCompletionDiffusion
 from models.refinement_net import chamfer_distance
 
+# Reproducibility seeds
+import random
+SEED = 42
+random.seed(SEED)
+np.random.seed(SEED)
+torch.manual_seed(SEED)
+if torch.cuda.is_available():
+    torch.cuda.manual_seed_all(SEED)
+
 
 def build_model(device="cuda"):
     encoder = SonataEncoder(
