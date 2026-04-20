@@ -65,3 +65,8 @@ eval_v1gt_fullval/**/per_frame*
 eval_v2gt_fullval/**/per_frame*
 eval_v1gt_fullval/**/*.npz
 eval_v2gt_fullval/**/*.npz
+
+## Additional runtime outputs
+uncertainty_results_da2/
+uncertainty_results_lidar/
+**/uncertainty_results_*/
