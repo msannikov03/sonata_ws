@@ -2,7 +2,7 @@
   "baseline_t200_1step": {
     "cd_mean": 0.038905380728344124,
     "cd_std": 0.008985520301003231,
-    "time_per_frame": 0.4345544735590617,
+    "time_per_frame": 0.4623966852823893,
     "start_t": 200,
     "num_steps": 1,
     "method": "single_step_x0"
@@ -10,26 +10,26 @@
   "ddim_t200_1steps": {
     "cd_mean": 0.038905380728344124,
     "cd_std": 0.008985520301003231,
-    "time_per_frame": 0.4345544735590617,
+    "time_per_frame": 0.4623966852823893,
     "start_t": 200,
     "num_steps": 1,
     "method": "ddim",
     "note": "equivalent to single-step x0 baseline"
   },
   "ddim_t200_2steps": {
-    "cd_mean": 0.03888761767496665,
-    "cd_std": 0.008834670444782778,
-    "time_per_frame": 0.5371286710103352,
+    "cd_mean": 0.03888761792331934,
+    "cd_std": 0.008834670461880514,
+    "time_per_frame": 0.5989219188690186,
     "start_t": 200,
     "num_steps": 2,
     "method": "ddim",
-    "delta_vs_baseline": -1.776305337747308e-05,
-    "pct_vs_baseline": -0.04565706091273896
+    "delta_vs_baseline": -1.7762805024787442e-05,
+    "pct_vs_baseline": -0.045656422562256355
   },
   "ddim_t200_5steps": {
     "cd_mean": 0.03926682385305564,
     "cd_std": 0.008582096864075371,
-    "time_per_frame": 0.8826870361963908,
+    "time_per_frame": 1.0190541982650756,
     "start_t": 200,
     "num_steps": 5,
     "method": "ddim",
@@ -39,7 +39,7 @@
   "ddim_t200_10steps": {
     "cd_mean": 0.039454882778227326,
     "cd_std": 0.008709230521055399,
-    "time_per_frame": 1.4541491826375326,
+    "time_per_frame": 1.5539318323135376,
     "start_t": 200,
     "num_steps": 10,
     "method": "ddim",
@@ -47,59 +47,59 @@
     "pct_vs_baseline": 1.4124063036937917
   },
   "ddim_t200_20steps": {
-    "cd_mean": 0.03971876750389735,
-    "cd_std": 0.008768853463244616,
-    "time_per_frame": 2.5835691610972087,
+    "cd_mean": 0.03971876762807369,
+    "cd_std": 0.008768853478959114,
+    "time_per_frame": 1.9507910887400308,
     "start_t": 200,
     "num_steps": 20,
     "method": "ddim",
-    "delta_vs_baseline": 0.0008133867755532251,
-    "pct_vs_baseline": 2.090679387595969
+    "delta_vs_baseline": 0.0008133868997295679,
+    "pct_vs_baseline": 2.0906797067712106
   },
   "ddim_t300_1steps": {
-    "cd_mean": 0.04120386919627587,
-    "cd_std": 0.009304199108314388,
-    "time_per_frame": 0.4127046267191569,
+    "cd_mean": 0.04120390880852938,
+    "cd_std": 0.009304234160455623,
+    "time_per_frame": 0.2746172746022542,
     "start_t": 300,
     "num_steps": 1,
     "method": "ddim",
-    "delta_vs_baseline": 0.0022984884679317433,
-    "pct_vs_baseline": 5.907893522443292
+    "delta_vs_baseline": 0.0022985280801852553,
+    "pct_vs_baseline": 5.90799533934566
   },
   "ddim_t300_2steps": {
-    "cd_mean": 0.04100894359871745,
-    "cd_std": 0.00929379621511206,
-    "time_per_frame": 0.5365501403808594,
+    "cd_mean": 0.04100918242086967,
+    "cd_std": 0.009293076373330877,
+    "time_per_frame": 0.36101157665252687,
     "start_t": 300,
     "num_steps": 2,
     "method": "ddim",
-    "delta_vs_baseline": 0.0021035628703733253,
-    "pct_vs_baseline": 5.406868744098412
+    "delta_vs_baseline": 0.0021038016925255462,
+    "pct_vs_baseline": 5.407482597883543
   },
   "ddim_t300_5steps": {
-    "cd_mean": 0.04123381432145834,
-    "cd_std": 0.009043776753490296,
-    "time_per_frame": 0.8949069420496623,
+    "cd_mean": 0.04123381444563468,
+    "cd_std": 0.009043776824076422,
+    "time_per_frame": 0.6333000103632609,
     "start_t": 300,
     "num_steps": 5,
     "method": "ddim",
-    "delta_vs_baseline": 0.0023284335931142153,
-    "pct_vs_baseline": 5.984862632170204
+    "delta_vs_baseline": 0.002328433717290558,
+    "pct_vs_baseline": 5.984862951345445
   },
   "ddim_t300_10steps": {
-    "cd_mean": 0.041550707258284095,
-    "cd_std": 0.009061888448810625,
-    "time_per_frame": 1.4580735127131144,
+    "cd_mean": 0.04155042165269454,
+    "cd_std": 0.009061658631600737,
+    "time_per_frame": 1.0671887477238973,
     "start_t": 300,
     "num_steps": 10,
     "method": "ddim",
-    "delta_vs_baseline": 0.0026453265299399703,
-    "pct_vs_baseline": 6.79938476482443
+    "delta_vs_baseline": 0.002645040924350417,
+    "pct_vs_baseline": 6.798650661766686
   },
   "ddim_t300_20steps": {
     "cd_mean": 0.041894001265366874,
     "cd_std": 0.008937840483771433,
-    "time_per_frame": 2.670766584078471,
+    "time_per_frame": 1.993794576327006,
     "start_t": 300,
     "num_steps": 20,
     "method": "ddim",
@@ -107,19 +107,19 @@
     "pct_vs_baseline": 7.681766586197217
   },
   "ddim_t500_1steps": {
-    "cd_mean": 0.04866913662602504,
-    "cd_std": 0.010829380126789018,
-    "time_per_frame": 0.4100073258082072,
+    "cd_mean": 0.04866913724690676,
+    "cd_std": 0.01082938013587856,
+    "time_per_frame": 0.3016485850016276,
     "start_t": 500,
     "num_steps": 1,
     "method": "ddim",
-    "delta_vs_baseline": 0.009763755897680915,
-    "pct_vs_baseline": 25.09615820458384
+    "delta_vs_baseline": 0.009763756518562636,
+    "pct_vs_baseline": 25.096159800460065
   },
   "ddim_t500_2steps": {
     "cd_mean": 0.047112562134861945,
     "cd_std": 0.010298591255774904,
-    "time_per_frame": 0.5504620552062989,
+    "time_per_frame": 0.3667942841847738,
     "start_t": 500,
     "num_steps": 2,
     "method": "ddim",
@@ -127,29 +127,29 @@
     "pct_vs_baseline": 21.095234779539275
   },
   "ddim_t500_5steps": {
-    "cd_mean": 0.047110148270924884,
-    "cd_std": 0.009985815851529297,
-    "time_per_frame": 0.8952646017074585,
+    "cd_mean": 0.04710989259183407,
+    "cd_std": 0.00998559500796288,
+    "time_per_frame": 0.6267170270284017,
     "start_t": 500,
     "num_steps": 5,
     "method": "ddim",
-    "delta_vs_baseline": 0.00820476754258076,
-    "pct_vs_baseline": 21.089030332000476
+    "delta_vs_baseline": 0.008204511863489944,
+    "pct_vs_baseline": 21.08837315017619
   },
   "ddim_t500_10steps": {
-    "cd_mean": 0.04753770586103201,
-    "cd_std": 0.009666648354411143,
-    "time_per_frame": 1.4519047260284423,
+    "cd_mean": 0.047537706606090066,
+    "cd_std": 0.009666648810390302,
+    "time_per_frame": 1.0695406436920165,
     "start_t": 500,
     "num_steps": 10,
     "method": "ddim",
-    "delta_vs_baseline": 0.008632325132687885,
-    "pct_vs_baseline": 22.187998089423377
+    "delta_vs_baseline": 0.008632325877745942,
+    "pct_vs_baseline": 22.188000004474823
   },
   "ddim_t500_20steps": {
     "cd_mean": 0.04767296885450681,
     "cd_std": 0.00964577418340119,
-    "time_per_frame": 2.6141526381174724,
+    "time_per_frame": 2.033698336283366,
     "start_t": 500,
     "num_steps": 20,
     "method": "ddim",
