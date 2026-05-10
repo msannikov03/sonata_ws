@@ -1,0 +1,83 @@
+{
+  "variants": {
+    "A_fair_ego_bbox_lidiff_crop": {
+      "pred_cd_mean": 1.1922980344295502,
+      "pred_cd_std": 0.6007973223576017,
+      "pred_cd_median": 0.9802208840847015,
+      "pred_cd_min": 0.23059126734733582,
+      "pred_cd_max": 2.438727855682373,
+      "scaffold_cd_mean": 12.40900668144226,
+      "scaffold_cd_std": 8.091632709675169,
+      "n_frames": 50,
+      "n_inf": 0,
+      "n_after_crop_mean": 12848.86,
+      "per_frame_time_s_mean": 0.21750933647155762,
+      "total_time_s": 18.9,
+      "crop_mode": "lidiff",
+      "cd_impl": "torch"
+    },
+    "A_fair_full_scaffold_lidiff_crop": {
+      "pred_cd_mean": 1.227944913506508,
+      "pred_cd_std": 0.5880422584441236,
+      "pred_cd_median": 1.0759499073028564,
+      "pred_cd_min": 0.26276084780693054,
+      "pred_cd_max": 2.498018980026245,
+      "scaffold_cd_mean": 12.444259752631188,
+      "scaffold_cd_std": 8.0653409563261,
+      "n_frames": 50,
+      "n_inf": 0,
+      "n_after_crop_mean": 11507.54,
+      "per_frame_time_s_mean": 0.2053588104248047,
+      "total_time_s": 17.3,
+      "crop_mode": "lidiff",
+      "cd_impl": "torch"
+    },
+    "A_fair_full_scaffold_no_crop": {
+      "pred_cd_mean": 83.95247760772705,
+      "pred_cd_std": 40.09247459062463,
+      "pred_cd_median": 78.40906143188477,
+      "pred_cd_min": 19.538082122802734,
+      "pred_cd_max": 181.33871459960938,
+      "scaffold_cd_mean": 146.5429299926758,
+      "scaffold_cd_std": 56.66331668191321,
+      "n_frames": 50,
+      "n_inf": 0,
+      "n_after_crop_mean": 20000.0,
+      "per_frame_time_s_mean": 0.20569539070129395,
+      "total_time_s": 24.8,
+      "crop_mode": "none",
+      "cd_impl": "torch"
+    },
+    "A_fair_lidiff_match_kdtree": {
+      "pred_cd_mean": 1.2338317873019815,
+      "pred_cd_std": 0.645013805565128,
+      "pred_cd_median": 1.048670679797633,
+      "pred_cd_min": 0.2509340069233036,
+      "pred_cd_max": 2.829739240510422,
+      "scaffold_cd_mean": 12.420634805252496,
+      "scaffold_cd_std": 8.083364328447313,
+      "n_frames": 50,
+      "n_inf": 0,
+      "n_after_crop_mean": 12836.62,
+      "per_frame_time_s_mean": 0.20942466259002684,
+      "total_time_s": 15.6,
+      "crop_mode": "lidiff",
+      "cd_impl": "kdtree"
+    }
+  },
+  "partial": false,
+  "num_frames": 50,
+  "checkpoint": "/home/anywherevla/sonata_ws/sonata-workspace-fixed/sonata-workspace/checkpoints/diffusion_v2gt_finetune_mixed_scaffold_seed45/best.pth",
+  "seed": 42,
+  "ego_bbox_min": [
+    -40.0,
+    -40.0,
+    -5.0
+  ],
+  "ego_bbox_max": [
+    40.0,
+    40.0,
+    5.0
+  ],
+  "lidiff_margin_m": 1.0
+}
