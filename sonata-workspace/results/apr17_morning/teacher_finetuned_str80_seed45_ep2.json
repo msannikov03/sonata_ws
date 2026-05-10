@@ -1,0 +1,83 @@
+{
+  "variants": {
+    "A_fair_ego_bbox_lidiff_crop": {
+      "pred_cd_mean": 1.0999771839380263,
+      "pred_cd_std": 0.5493115843489128,
+      "pred_cd_median": 0.9649782776832581,
+      "pred_cd_min": 0.20634186267852783,
+      "pred_cd_max": 2.602400064468384,
+      "scaffold_cd_mean": 12.40900668144226,
+      "scaffold_cd_std": 8.091632709675169,
+      "n_frames": 50,
+      "n_inf": 0,
+      "n_after_crop_mean": 13082.98,
+      "per_frame_time_s_mean": 0.21741801738739014,
+      "total_time_s": 19.0,
+      "crop_mode": "lidiff",
+      "cd_impl": "torch"
+    },
+    "A_fair_full_scaffold_lidiff_crop": {
+      "pred_cd_mean": 1.1355697742104531,
+      "pred_cd_std": 0.5198842994934317,
+      "pred_cd_median": 1.0342211723327637,
+      "pred_cd_min": 0.23715399205684662,
+      "pred_cd_max": 2.6209464073181152,
+      "scaffold_cd_mean": 12.444259752631188,
+      "scaffold_cd_std": 8.0653409563261,
+      "n_frames": 50,
+      "n_inf": 0,
+      "n_after_crop_mean": 11786.9,
+      "per_frame_time_s_mean": 0.2057325839996338,
+      "total_time_s": 17.5,
+      "crop_mode": "lidiff",
+      "cd_impl": "torch"
+    },
+    "A_fair_full_scaffold_no_crop": {
+      "pred_cd_mean": 78.84661251068115,
+      "pred_cd_std": 38.708102597026354,
+      "pred_cd_median": 72.50261306762695,
+      "pred_cd_min": 18.512197494506836,
+      "pred_cd_max": 179.14988708496094,
+      "scaffold_cd_mean": 146.5429299926758,
+      "scaffold_cd_std": 56.66331668191321,
+      "n_frames": 50,
+      "n_inf": 0,
+      "n_after_crop_mean": 20000.0,
+      "per_frame_time_s_mean": 0.2058409309387207,
+      "total_time_s": 24.8,
+      "crop_mode": "none",
+      "cd_impl": "torch"
+    },
+    "A_fair_lidiff_match_kdtree": {
+      "pred_cd_mean": 1.1223324388471771,
+      "pred_cd_std": 0.540619854632195,
+      "pred_cd_median": 1.0044335115521332,
+      "pred_cd_min": 0.211859354829403,
+      "pred_cd_max": 2.5213068837892987,
+      "scaffold_cd_mean": 12.420634805252496,
+      "scaffold_cd_std": 8.083364328447313,
+      "n_frames": 50,
+      "n_inf": 0,
+      "n_after_crop_mean": 13076.02,
+      "per_frame_time_s_mean": 0.20954845428466798,
+      "total_time_s": 15.7,
+      "crop_mode": "lidiff",
+      "cd_impl": "kdtree"
+    }
+  },
+  "partial": false,
+  "num_frames": 50,
+  "checkpoint": "/home/anywherevla/sonata_ws/sonata-workspace-fixed/sonata-workspace/checkpoints/diffusion_v2gt_finetune_mixed_scaffold_seed45/epoch_2.pth",
+  "seed": 42,
+  "ego_bbox_min": [
+    -40.0,
+    -40.0,
+    -5.0
+  ],
+  "ego_bbox_max": [
+    40.0,
+    40.0,
+    5.0
+  ],
+  "lidiff_margin_m": 1.0
+}
