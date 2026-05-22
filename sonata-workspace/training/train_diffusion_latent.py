@@ -187,9 +187,18 @@ def _infer_vae_from_full_state_dict(sd: dict) -> tuple:
 
 
 def load_vae_from_checkpoint(path: str, device: torch.device):
-    """Load a standalone point-VAE or VQ-VAE checkpoint (keys without 'vae.' prefix)."""
+    """Load a standalone VAE checkpoint (V3 or VAE-GAN format).
+
+    Accepts two checkpoint layouts:
+      - V3 standalone:  ck["model_state_dict"]          (train_point_vae_v3.py)
+      - VAE-GAN:        ck["vae_state_dict"]             (train_vae_gan.py)
+    """
     ck = torch.load(os.path.expanduser(path), map_location="cpu")
-    sd = ck["model_state_dict"]
+    # VAE-GAN checkpoints store the VAE under 'vae_state_dict'
+    if "vae_state_dict" in ck:
+        sd = ck["vae_state_dict"]
+    else:
+        sd = ck["model_state_dict"]
 
     # --- Multi-token Gaussian VAE (v2) ---
     if "mu_proj.weight" in sd:
