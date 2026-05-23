@@ -82,6 +82,8 @@ class SemanticKITTI(Dataset):
         use_point_cloud: bool = False,
         point_max_partial: Optional[int] = None,
         point_max_complete: Optional[int] = None,
+        gt_subdir: str = 'ground_truth',
+        gt_name_suffix: str = '',
     ):
         """
         Initialize SemanticKITTI dataset.
@@ -116,7 +118,9 @@ class SemanticKITTI(Dataset):
         self.use_point_cloud = use_point_cloud
         self.point_max_partial = point_max_partial
         self.point_max_complete = point_max_complete
-        
+        self.gt_subdir = gt_subdir
+        self.gt_name_suffix = gt_name_suffix
+
         # Get sequences for this split
         self.sequences = self.SPLITS[split]
         
@@ -173,7 +177,7 @@ class SemanticKITTI(Dataset):
                 # Ground truth map (if using pre-generated)
                 if self.use_ground_truth_maps:
                     gt_map_path = os.path.join(
-                        self.root, 'ground_truth', seq, f'{scan_id}.npz'
+                        self.root, self.gt_subdir, seq, f'{scan_id}{self.gt_name_suffix}.npz'
                     )
                     self.gt_map_files.append(gt_map_path)
                 

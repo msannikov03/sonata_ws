@@ -43,8 +43,10 @@ from __future__ import annotations
 
 import argparse
 import os
+import random
 import sys
 
+import numpy as np
 import torch
 import torch.optim as optim
 from torch.utils.data import DataLoader
@@ -187,6 +189,10 @@ def parse_args():
     # GT data version
     p.add_argument("--gt_subdir", type=str, default="ground_truth")
     p.add_argument("--gt_name_suffix", type=str, default="")
+
+    # Reproducibility
+    p.add_argument("--seed", type=int, default=None,
+                   help="Set torch/numpy/random seeds + DataLoader worker seeding.")
     return p.parse_args()
 
 
@@ -446,6 +452,13 @@ def main():
     logger = setup_logger(args.output_dir)
     logger.info(args)
 
+    if args.seed is not None:
+        torch.manual_seed(args.seed)
+        torch.cuda.manual_seed_all(args.seed)
+        np.random.seed(args.seed)
+        random.seed(args.seed)
+        logger.info(f"Seeded with {args.seed}")
+
     if args.device:
         device = torch.device(args.device)
     else:
@@ -473,13 +486,20 @@ def main():
         **ds_kwargs,
     )
 
+    seed_base = args.seed if args.seed is not None else 0
+    def _worker_init(wid: int):
+        np.random.seed(seed_base + wid)
+        random.seed(seed_base + wid)
+
     train_loader = DataLoader(
         ds_train, batch_size=args.batch_size, shuffle=True,
         num_workers=args.num_workers, collate_fn=collate_fn, pin_memory=True,
+        worker_init_fn=_worker_init,
     )
     val_loader = DataLoader(
         ds_val, batch_size=args.batch_size, shuffle=False,
         num_workers=args.num_workers, collate_fn=collate_fn, pin_memory=True,
+        worker_init_fn=_worker_init,
     )
 
     # --- Models ---
