@@ -1,15 +1,53 @@
-## Sonata-LiDiff + VoxFormerDepthPro
+# CloudDiffusion (Sonata-LiDiff + VoxFormerDepthPro)
+
+Code for the SMC 2026 **CloudDiffusion** paper (with an RA-L companion): diffusion-based
+3D semantic scene completion on SemanticKITTI, built on a frozen **Sonata** encoder and a
+**coordinate-space diffusion** teacher, plus a multi-token Gaussian VAE and a drift-reduced
+ground-truth ("boost v2") build.
 
 Unified workspace for:
 
 - **Sonata-LiDiff** – diffusion-based 3D semantic scene completion on SemanticKITTI.
 - **VoxFormerDepthPro** – RGB → Depth Pro → LiDAR-style point clouds for Sonata.
 
-This repo is set up so you can:
+It supports training Sonata on real LiDAR (SemanticKITTI velodyne), on pseudo-LiDAR from
+RGB (Depth Pro), and comparing both pipelines end-to-end.
 
-- Train Sonata on **real LiDAR** (SemanticKITTI velodyne).
-- Train Sonata on **pseudo-LiDAR from RGB** (Depth Pro).
-- Compare both pipelines end-to-end with simple commands.
+## Headline results (what this repo reproduces)
+
+| Component | Number | Entry point | Canonical artifact |
+|---|---|---|---|
+| Multi-token Gaussian VAE | **CD 0.120** | `training/train_point_vae.py` (train) → `eval_vae_multitoken.py` (eval) | `models/point_cloud_vae.py` (`PointCloudVAE`) |
+| Coordinate-space diffusion teacher | — | `training/train_diffusion.py` → `checkpoints/diffusion_v2gt/best_model.pth` | `models/diffusion_module.py` (`SceneCompletionDiffusion`) |
+| GT v2 / v1 Chamfer | **CD 0.024 / 0.396** | `evaluate_ral_metrics.py` (via `run_ral_metrics_all.sh`) | `eval_v2gt_fullval/.../all_metrics.json`, `eval_v1gt_fullval/.../all_metrics.json` |
+| Drift-reduced GT build (boost v2) | — | `data/map_from_scans_boost_v2.py` + `scripts/run_boost_v2_gt.sh` | `data/MAP_FROM_SCANS_BOOST_V2_RUNBOOK.md` |
+| Inference latency | **209 ms** | `run_latency_benchmark.py` | `results/apr17_morning/latency_benchmark.json` |
+| RA-L stats (Wilcoxon) | — | `verify_ral_numbers.py`, `wilcoxon_test.py` | root `eval_*.json` summaries |
+
+> **Naming trap:** the final multi-token Gaussian VAE is the **un-suffixed**
+> `models/point_cloud_vae.py`. The file named `models/point_cloud_vae_v2.py`
+> (`PointCloudVAEv2`) is the *older* global-pool + FoldingNet design — do not confuse them.
+
+## Reproduce the VAE result end-to-end
+
+1. **Install** (from this `sonata-workspace/` dir): `pip install -e .` (needs `requirements.txt`, now present).
+2. **Build the GT** first — the dataset loads `ground_truth/<seq>/<id>.npz`. Run the boost-v2
+   pipeline per `data/MAP_FROM_SCANS_BOOST_V2_RUNBOOK.md` (writes into `ground_truth/`).
+3. **Train the VAE** (final config; the README §6.1 command, *not* the older
+   `run_vae_training.sh` which encodes a smaller/stale config):
+   ```bash
+   python training/train_point_vae.py \
+     --data_path <DATASET_ROOT>/sonata_depth_pro \
+     --output_dir checkpoints/point_vae_multitoken \
+     --latent_dim 1024 --num_latent_tokens 16 \
+     --num_decoded_points 4096 --num_dec_blocks 3 --beta_kl 1e-4
+   ```
+4. **Eval**: `python eval_vae_multitoken.py` (expects the checkpoint under
+   `checkpoints/point_vae_multitoken/`).
+
+Replace `<DATASET_ROOT>` with your SemanticKITTI / `sonata_depth_pro` root. Many scripts in
+this repo still hardcode personal absolute paths (`/home/anywherevla/...`, `~/Simon_ws/...`);
+prefer the argparse flags shown above and adjust paths to your machine.
 
 ---
 
@@ -19,7 +57,7 @@ Create and activate your `sonata_lidiff` environment (if not already):
 
 ```bash
 conda activate sonata_lidiff
-cd ~/Simon_ws/sonata-workspace
+cd sonata-workspace
 pip install -e .
 ```
 
@@ -66,7 +104,7 @@ For more dataset detail, see `VoxFormerDepthPro/DATASET_AND_RUN.md`.
 From the repo root:
 
 ```bash
-cd ~/Simon_ws/sonata-workspace
+cd sonata-workspace
 conda activate sonata_lidiff
 ```
 
