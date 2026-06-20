@@ -19,12 +19,12 @@ with open("requirements.txt", "r", encoding="utf-8") as fh:
 setup(
     name="sonata-lidiff",
     version="0.1.0",
-    author="Your Name",
-    author_email="your.email@example.com",
-    description="Semantic Scene Completion with Sonata Encoder and LiDiff Diffusion",
+    author="Mikhail Sannikov",
+    author_email="msannikov03@icloud.com",
+    description="CloudDiffusion: Semantic Scene Completion with a Sonata Encoder and coordinate-space diffusion",
     long_description=long_description,
     long_description_content_type="text/markdown",
-    url="https://github.com/yourusername/sonata-lidiff",
+    url="https://github.com/msannikov03/sonata_ws",
     packages=find_packages(),
     classifiers=[
         "Development Status :: 3 - Alpha",
