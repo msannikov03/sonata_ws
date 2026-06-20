@@ -1,0 +1,41 @@
+# Core dependencies for Sonata-LiDiff / CloudDiffusion
+# (multi-token Gaussian VAE + coordinate-space diffusion teacher + GT build + eval)
+
+torch>=2.0.0
+torchvision>=0.15.0
+numpy>=1.21.0,<2.0.0        # Open3D requires numpy <2.0 (1.26.4 verified)
+scipy==1.11.4              # pinned: 1.13.x breaks Open3D / scipy.interpolate
+
+# Sparse convolution. Only needed by the Sonata encoder (loaded from HuggingFace);
+# the diffusion module uses transformer blocks, not sparse conv.
+# Adjust the CUDA build to your toolkit (cu118 / cu121 / cu124).
+spconv-cu124
+
+# Point-cloud processing
+open3d>=0.16.0
+
+# Sonata encoder
+flash-attn>=2.0.0          # optional but recommended
+huggingface_hub
+timm
+
+# NOTE: torch-scatter is intentionally NOT listed here. It needs a wheel matching
+# your exact torch+CUDA build; install it separately, e.g.:
+#   pip install torch-scatter -f https://data.pyg.org/whl/torch-${TORCH}+${CUDA}.html
+# See docs/small talks/install_dependencies.sh for the PyG-matched recipe.
+
+# Data processing
+pyyaml>=5.4.0
+h5py>=3.0.0
+
+# Training & logging
+tensorboard>=2.8.0
+tqdm>=4.60.0
+matplotlib>=3.3.0
+pillow>=8.0.0
+
+# Evaluation
+scikit-learn>=0.24.0
+
+# Utilities
+psutil
